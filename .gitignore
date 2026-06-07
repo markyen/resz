@@ -1,0 +1,14 @@
+# Built binary
+/resz
+
+# Machine-managed state (auth cache, cooldown, health)
+/state/
+
+# User config (venues.json, notify.json) — local to each install
+/config/
+
+# Local logs
+/logs/
+
+# Wrappers hold local credentials and environment setup
+/wrappers/
