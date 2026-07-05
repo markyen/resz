@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"resz/internal/respath"
 )
@@ -101,8 +102,9 @@ func Save(path string, cfg *Config) error {
 	return os.Rename(tmp, path)
 }
 
-// AddBlackout appends a YYYY-MM-DD date to BlackoutDates if it isn't
-// already present. Returns true if the date was added.
+// AddBlackout inserts a YYYY-MM-DD date into BlackoutDates if it isn't
+// already present, keeping the list sorted (which is chronological for
+// YYYY-MM-DD). Returns true if the date was added.
 func (c *Config) AddBlackout(date string) bool {
 	for _, d := range c.BlackoutDates {
 		if d == date {
@@ -110,6 +112,7 @@ func (c *Config) AddBlackout(date string) bool {
 		}
 	}
 	c.BlackoutDates = append(c.BlackoutDates, date)
+	sort.Strings(c.BlackoutDates)
 	return true
 }
 

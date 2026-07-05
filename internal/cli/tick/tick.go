@@ -1,6 +1,6 @@
 // Package tick implements the `resz tick` subcommand: a single cron
-// entrypoint that runs config housekeeping (ID backfill, past
-// blackout-date prune) and then invokes check followed by snipe.
+// entrypoint that runs config housekeeping (pruning past blackout dates)
+// and then invokes check followed by snipe.
 //
 // Intended to be wired into cron every ~30 minutes. Check runs first
 // because it's fast; snipe runs second because it may sleep up to ~31
@@ -16,7 +16,6 @@ import (
 	"resz/internal/cli/check"
 	"resz/internal/cli/snipe"
 	"resz/internal/reslog"
-	"resz/internal/resyapi"
 	"resz/internal/venueconfig"
 )
 
@@ -76,38 +75,11 @@ func Main(args []string) int {
 	return snipeRC
 }
 
-// housekeep performs two idempotent cleanups on the loaded config:
-// backfilling any venue's missing ID via Resy search, and dropping
-// blackout_dates strictly before today. Returns true if anything
-// changed.
+// housekeep drops blackout_dates strictly before today. Returns true if
+// anything changed. (Venues are added with their ID already resolved via
+// `resz search -add`, so no ID backfill happens here.)
 func housekeep(lg interface{ Printf(string, ...any) }, cfg *venueconfig.Config, now time.Time) bool {
 	dirty := false
-	for i, e := range cfg.Venues {
-		if e.ID != "" || e.Name == "" {
-			continue
-		}
-		citySlug := e.City
-		if citySlug == "" {
-			citySlug = resyapi.DefaultCity
-		}
-		city, ok := resyapi.LookupCity(citySlug)
-		if !ok {
-			lg.Printf("entry %q: unknown city %q (skipping backfill)", e.Name, citySlug)
-			continue
-		}
-		hits, err := resyapi.Search(e.Name, city.Lat, city.Long)
-		if err != nil {
-			lg.Printf("search %q in %s: %v", e.Name, city.Slug, err)
-			continue
-		}
-		if len(hits) == 0 {
-			lg.Printf("search %q in %s: no results", e.Name, city.Slug)
-			continue
-		}
-		cfg.Venues[i].ID = hits[0].ID.Resy.String()
-		lg.Printf("resolved %q -> id %s (matched %q in %s)", e.Name, cfg.Venues[i].ID, hits[0].Name, city.Slug)
-		dirty = true
-	}
 	today := now.Format("2006-01-02")
 	n := 0
 	for _, d := range cfg.BlackoutDates {

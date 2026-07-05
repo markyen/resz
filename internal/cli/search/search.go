@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"resz/internal/resyapi"
+	"resz/internal/venueconfig"
 )
 
 // Main runs the search subcommand. Returns a process exit code.
@@ -19,8 +20,10 @@ func Main(args []string) int {
 	interactive := fs.Bool("i", false, "interactively choose a result by name")
 	cityFlag := fs.String("city", resyapi.DefaultCity, "city slug to bias search (use -list-cities to see all)")
 	listCities := fs.Bool("list-cities", false, "print supported city slugs and exit")
+	addFlag := fs.Bool("a", false, "add the resolved venue to the config with an empty check block (instead of printing its id)")
+	configFlag := fs.String("c", "", "config file path for -a (defaults to <workspace>/config/venues.json)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: resz search [-i] [-city SLUG] <restaurant name>\n")
+		fmt.Fprintf(os.Stderr, "usage: resz search [-i] [-a [-c PATH]] [-city SLUG] <restaurant name>\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -65,7 +68,52 @@ func Main(args []string) int {
 		}
 	}
 
-	fmt.Println(hits[idx].ID.Resy.String())
+	hit := hits[idx]
+	if *addFlag {
+		return addToConfig(*configFlag, hit, city)
+	}
+	fmt.Println(hit.ID.Resy.String())
+	return 0
+}
+
+// addToConfig appends hit to the venues config at path (default location if
+// empty), with an empty check block so `resz check` picks it up. A missing
+// config file is created; a venue whose id is already present is left alone.
+func addToConfig(path string, hit resyapi.Hit, city *resyapi.City) int {
+	if path == "" {
+		p, err := venueconfig.DefaultPath()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "config path:", err)
+			return 1
+		}
+		path = p
+	}
+	cfg, err := venueconfig.Load(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintln(os.Stderr, "load config:", err)
+			return 1
+		}
+		cfg = &venueconfig.Config{}
+	}
+	id := hit.ID.Resy.String()
+	for _, v := range cfg.Venues {
+		if v.ID == id {
+			fmt.Fprintf(os.Stderr, "%s (id %s) is already in %s\n", hit.Name, id, path)
+			return 0
+		}
+	}
+	cfg.Venues = append(cfg.Venues, venueconfig.ConfigEntry{
+		Name:  hit.Name,
+		ID:    id,
+		City:  city.Slug,
+		Check: &venueconfig.CheckConfig{},
+	})
+	if err := venueconfig.Save(path, cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "save config:", err)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "added %s (id %s) to %s\n", hit.Name, id, path)
 	return 0
 }
 
