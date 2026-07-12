@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"resz/internal/cliflag"
 	"resz/internal/notify"
 	"resz/internal/resyapi"
 	"resz/internal/resyflow"
@@ -47,9 +48,9 @@ func Main(args []string) int {
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: resz snipe [-c PATH] [-v] [-e EMAIL]\n")
 		fmt.Fprintln(os.Stderr, "Reads config, snipes any venues whose target_time is 1-31 min from now.")
-		fs.PrintDefaults()
+		cliflag.PrintDefaults(fs)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
 		return 2
 	}
 	verbose = *verboseFlag

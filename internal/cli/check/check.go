@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"resz/internal/cliflag"
 	"resz/internal/notify"
 	"resz/internal/reslog"
 	"resz/internal/resyapi"
@@ -27,10 +28,10 @@ func Main(args []string) int {
 	forceFlag := fs.Bool("f", false, "bypass cooldown")
 	notifyFlag := fs.Bool("notify", true, "send notification on health flips and booking success")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: resz check [-c PATH] [-v] [-f] [-notify=false]\n")
-		fs.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "usage: resz check [-c PATH] [-v] [-f] [--notify=false]\n")
+		cliflag.PrintDefaults(fs)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
 		return 2
 	}
 

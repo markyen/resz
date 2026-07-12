@@ -15,6 +15,7 @@ import (
 
 	"resz/internal/cli/check"
 	"resz/internal/cli/snipe"
+	"resz/internal/cliflag"
 	"resz/internal/reslog"
 	"resz/internal/venueconfig"
 )
@@ -27,9 +28,9 @@ func Main(args []string) int {
 	verboseFlag := fs.Bool("v", false, "echo log output to stderr as well as the log file")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: resz tick [-c PATH] [-v]\n")
-		fs.PrintDefaults()
+		cliflag.PrintDefaults(fs)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
 		return 2
 	}
 

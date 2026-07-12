@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"resz/internal/cliflag"
 	"resz/internal/resyapi"
 	"resz/internal/resyflow"
 	"resz/internal/venueconfig"
@@ -55,11 +56,11 @@ func Main(args []string) int {
 	verboseFlag := fs.Bool("v", false, "print URLs and full response bodies on errors")
 	configFlag := fs.String("c", "", "snipe config file (provides venues and blackout_dates)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: resz availability [-s N] [-i] [-v] [-city SLUG] [-c CONFIG] (-n <name> | <venue_id> | (config venues))\n")
+		fmt.Fprintf(os.Stderr, "usage: resz availability [-s N] [-i] [-v] [--city SLUG] [-c CONFIG] (-n <name> | <venue_id> | (config venues))\n")
 		fmt.Fprintln(os.Stderr, "  With no name or venue_id, checks all venues in the config file.")
-		fs.PrintDefaults()
+		cliflag.PrintDefaults(fs)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
 		return 2
 	}
 	verbose = *verboseFlag

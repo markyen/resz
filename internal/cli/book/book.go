@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"resz/internal/cliflag"
 	"resz/internal/resyflow"
 )
 
@@ -34,9 +35,9 @@ func Main(args []string) int {
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: resz book [-v] [-e EMAIL] <rgs://config_id>\n")
 		fmt.Fprintln(os.Stderr, "Token is loaded from cache or refreshed; password is read from $RESY_PASSWORD.")
-		fs.PrintDefaults()
+		cliflag.PrintDefaults(fs)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
 		return 2
 	}
 	verbose = *verboseFlag

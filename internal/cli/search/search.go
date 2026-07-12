@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"resz/internal/cliflag"
 	"resz/internal/resyapi"
 	"resz/internal/venueconfig"
 )
@@ -18,16 +19,33 @@ func Main(args []string) int {
 	fs := flag.NewFlagSet("resz search", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	interactive := fs.Bool("i", false, "interactively choose a result by name")
-	cityFlag := fs.String("city", resyapi.DefaultCity, "city slug to bias search (use -list-cities to see all)")
+	cityFlag := fs.String("city", resyapi.DefaultCity, "city slug to bias search (use --list-cities to see all)")
 	listCities := fs.Bool("list-cities", false, "print supported city slugs and exit")
 	addFlag := fs.Bool("a", false, "add the resolved venue to the config with an empty check block (instead of printing its id)")
 	configFlag := fs.String("c", "", "config file path for -a (defaults to <workspace>/config/venues.json)")
+	partySizeFlag := fs.Int("s", 2, "party size to store on the added venue (only used with -a)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: resz search [-i] [-a [-c PATH]] [-city SLUG] <restaurant name>\n")
-		fs.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "usage: resz search [-i] [-a [-c PATH] [-s N]] [--city SLUG] <restaurant name>\n")
+		cliflag.PrintDefaults(fs)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
 		return 2
+	}
+	// Only persist party size on -add when it was explicitly given;
+	// otherwise leave it unset (0) so the commands apply their own default.
+	sSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "s" {
+			sSet = true
+		}
+	})
+	if sSet && *partySizeFlag < 1 {
+		fmt.Fprintln(os.Stderr, "party size must be >= 1")
+		return 2
+	}
+	partySize := 0
+	if sSet {
+		partySize = *partySizeFlag
 	}
 
 	if *listCities {
@@ -39,7 +57,7 @@ func Main(args []string) int {
 
 	city, ok := resyapi.LookupCity(*cityFlag)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "unknown city %q (use -list-cities to see supported)\n", *cityFlag)
+		fmt.Fprintf(os.Stderr, "unknown city %q (use --list-cities to see supported)\n", *cityFlag)
 		return 2
 	}
 
@@ -70,16 +88,18 @@ func Main(args []string) int {
 
 	hit := hits[idx]
 	if *addFlag {
-		return addToConfig(*configFlag, hit, city)
+		return addToConfig(*configFlag, hit, city, partySize)
 	}
 	fmt.Println(hit.ID.Resy.String())
 	return 0
 }
 
 // addToConfig appends hit to the venues config at path (default location if
-// empty), with an empty check block so `resz check` picks it up. A missing
-// config file is created; a venue whose id is already present is left alone.
-func addToConfig(path string, hit resyapi.Hit, city *resyapi.City) int {
+// empty), with an empty check block so `resz check` picks it up. partySize
+// is stored on the entry when non-zero; zero leaves it unset so the
+// commands apply their default. A missing config file is created; a venue
+// whose id is already present is left alone.
+func addToConfig(path string, hit resyapi.Hit, city *resyapi.City, partySize int) int {
 	if path == "" {
 		p, err := venueconfig.DefaultPath()
 		if err != nil {
@@ -104,10 +124,11 @@ func addToConfig(path string, hit resyapi.Hit, city *resyapi.City) int {
 		}
 	}
 	cfg.Venues = append(cfg.Venues, venueconfig.ConfigEntry{
-		Name:  hit.Name,
-		ID:    id,
-		City:  city.Slug,
-		Check: &venueconfig.CheckConfig{},
+		Name:      hit.Name,
+		ID:        id,
+		PartySize: partySize,
+		City:      city.Slug,
+		Check:     &venueconfig.CheckConfig{},
 	})
 	if err := venueconfig.Save(path, cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "save config:", err)
