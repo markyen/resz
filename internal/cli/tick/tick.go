@@ -76,21 +76,29 @@ func Main(args []string) int {
 	return snipeRC
 }
 
-// housekeep drops blackout_dates strictly before today. Returns true if
+// housekeep drops blackout_dates strictly before today and removes any
+// duplicate entries (keeping the first occurrence). Returns true if
 // anything changed. (Venues are added with their ID already resolved via
 // `resz search -add`, so no ID backfill happens here.)
 func housekeep(lg interface{ Printf(string, ...any) }, cfg *venueconfig.Config, now time.Time) bool {
 	dirty := false
 	today := now.Format("2006-01-02")
+	seen := make(map[string]bool, len(cfg.BlackoutDates))
 	n := 0
 	for _, d := range cfg.BlackoutDates {
-		if d >= today {
-			cfg.BlackoutDates[n] = d
-			n++
+		if d < today {
+			lg.Printf("pruned past blackout date %s", d)
+			dirty = true
 			continue
 		}
-		lg.Printf("pruned past blackout date %s", d)
-		dirty = true
+		if seen[d] {
+			lg.Printf("pruned duplicate blackout date %s", d)
+			dirty = true
+			continue
+		}
+		seen[d] = true
+		cfg.BlackoutDates[n] = d
+		n++
 	}
 	cfg.BlackoutDates = cfg.BlackoutDates[:n]
 	return dirty

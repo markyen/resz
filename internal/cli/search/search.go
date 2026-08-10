@@ -31,7 +31,7 @@ func Main(args []string) int {
 	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
 		return 2
 	}
-	// Only persist party size on -add when it was explicitly given;
+	// Only persist party size on -a when it was explicitly given;
 	// otherwise leave it unset (0) so the commands apply their own default.
 	sSet := false
 	fs.Visit(func(f *flag.Flag) {
