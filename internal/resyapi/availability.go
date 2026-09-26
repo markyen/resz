@@ -4,20 +4,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
+
+	"resz/internal/platform"
 )
 
 const (
 	calendarURL = BaseURL + "/4/venue/calendar"
 	findURL     = BaseURL + "/4/find"
+
+	// slotDateLayout is how /4/find formats a slot's local start time.
+	slotDateLayout = "2006-01-02 15:04:05"
 )
 
-// Slot is a bookable reservation slot returned by /4/find.
-type Slot struct {
+// slot is a bookable reservation slot as /4/find returns it, before
+// normalization into a platform.Slot.
+type slot struct {
 	Config struct {
 		Token string `json:"token"`
 		Type  string `json:"type"`
@@ -25,16 +30,6 @@ type Slot struct {
 	Date struct {
 		Start string `json:"start"`
 	} `json:"date"`
-}
-
-// StartLabel renders the slot's start time as "Mon, Jan 2 at 3:04 PM",
-// falling back to the raw API string if it can't be parsed.
-func (s Slot) StartLabel() string {
-	t, err := time.Parse("2006-01-02 15:04:05", s.Date.Start)
-	if err != nil {
-		return s.Date.Start
-	}
-	return t.Format("Mon, Jan 2 at 3:04 PM")
 }
 
 type calendarResponse struct {
@@ -49,7 +44,7 @@ type calendarResponse struct {
 type findResponse struct {
 	Results struct {
 		Venues []struct {
-			Slots []Slot `json:"slots"`
+			Slots []slot `json:"slots"`
 		} `json:"venues"`
 	} `json:"results"`
 }
@@ -59,8 +54,8 @@ type findResponse struct {
 func AvailableDates(client *http.Client, venueID string, partySize int, logger func(string)) ([]string, error) {
 	today := time.Now()
 	q := url.Values{}
-	q.Set("start_date", today.Format("2006-01-02"))
-	q.Set("end_date", today.AddDate(1, 0, 0).Format("2006-01-02"))
+	q.Set("start_date", today.Format(platform.DateLayout))
+	q.Set("end_date", today.AddDate(1, 0, 0).Format(platform.DateLayout))
 	q.Set("num_seats", strconv.Itoa(partySize))
 	q.Set("venue_id", venueID)
 
@@ -78,16 +73,10 @@ func AvailableDates(client *http.Client, venueID string, partySize int, logger f
 	return dates, nil
 }
 
-// Window is an inclusive HH:MM interval. Pass nil to SlotsInWindow to
-// fall back to the default weekday 18:30-20:00 / weekend 11:30-20:00.
-type Window struct {
-	Earliest string
-	Latest   string
-}
-
-// SlotsInWindow returns slots on `date` whose start time falls within the
-// given window (or the default weekday/weekend window if window is nil).
-func SlotsInWindow(client *http.Client, venueID, date string, partySize int, venue *Venue, window *Window, logger func(string)) ([]Slot, error) {
+// Slots returns every slot /4/find offers for the venue on `date`.
+// Filtering to a booking window is the caller's job — see
+// platform.FilterWindow.
+func Slots(client *http.Client, venueID, date string, partySize int, venue *Venue, logger func(string)) ([]platform.Slot, error) {
 	q := url.Values{}
 	q.Set("day", date)
 	q.Set("lat", venue.LatString())
@@ -103,85 +92,29 @@ func SlotsInWindow(client *http.Client, venueID, date string, partySize int, ven
 		return nil, err
 	}
 
-	day, err := time.Parse("2006-01-02", date)
-	if err != nil {
-		return nil, err
-	}
-	weekend := day.Weekday() == time.Saturday || day.Weekday() == time.Sunday
-
-	var earliest, latest time.Time
-	switch {
-	case window != nil:
-		var e1, e2 error
-		earliest, e1 = parseHM(date, window.Earliest)
-		latest, e2 = parseHM(date, window.Latest)
-		if e1 != nil {
-			return nil, fmt.Errorf("invalid time_range start %q: want HH:MM", window.Earliest)
-		}
-		if e2 != nil {
-			return nil, fmt.Errorf("invalid time_range end %q: want HH:MM", window.Latest)
-		}
-	case weekend:
-		earliest, _ = parseHM(date, "11:30")
-		latest, _ = parseHM(date, "20:00")
-	default:
-		earliest, _ = parseHM(date, "18:30")
-		latest, _ = parseHM(date, "20:00")
-	}
-
-	var matched []Slot
+	var slots []platform.Slot
 	for _, v := range out.Results.Venues {
 		for _, s := range v.Slots {
-			t, err := time.Parse("2006-01-02 15:04:05", s.Date.Start)
+			start, err := time.Parse(slotDateLayout, s.Date.Start)
 			if err != nil {
 				continue
 			}
-			if t.Before(earliest) || t.After(latest) {
-				continue
-			}
-			matched = append(matched, s)
+			slots = append(slots, platform.Slot{
+				Platform: platform.Resy,
+				Start:    start,
+				Ref:      s.Config.Token,
+				Label:    s.Config.Type,
+			})
 		}
 	}
-	return matched, nil
-}
-
-// BestSlotIndex returns the index in `slots` of the slot whose start time
-// is closest to `preferred` ("HH:MM" on the slot's own date). Returns -1
-// if slots is empty.
-func BestSlotIndex(slots []Slot, preferred string) int {
-	if len(slots) == 0 {
-		return -1
-	}
-	bestDelta := math.MaxInt64
-	best := -1
-	for i, s := range slots {
-		t, err := time.Parse("2006-01-02 15:04:05", s.Date.Start)
-		if err != nil {
-			continue
-		}
-		// Build target time on the same date as the slot.
-		date := t.Format("2006-01-02")
-		target, _ := parseHM(date, preferred)
-		delta := int(math.Abs(float64(t.Sub(target))))
-		if delta < bestDelta {
-			bestDelta = delta
-			best = i
-		}
-	}
-	return best
-}
-
-func parseHM(date, hm string) (time.Time, error) {
-	return time.Parse("2006-01-02 15:04", date+" "+hm)
+	return slots, nil
 }
 
 // GetJSON issues a GET with the standard Resy headers and decodes a JSON
 // response. Non-2xx responses become errors that include a snippet of the
 // response body.
 func GetJSON(client *http.Client, rawURL string, out any, logger func(string)) error {
-	if client == nil {
-		client = http.DefaultClient
-	}
+	client = platform.HTTPClient(client)
 	if logger != nil {
 		logger("GET " + rawURL)
 	}

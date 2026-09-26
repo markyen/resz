@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"resz/internal/platform"
 	"resz/internal/respath"
 )
 
@@ -20,17 +21,42 @@ type Config struct {
 	BlackoutDates []string      `json:"blackout_dates,omitempty"`
 }
 
-// ConfigEntry is one venue we care about. Identity (Name, ID) and the
-// cross-feature settings (PartySize, City) live at the top level. The
-// Snipe and Check sub-blocks describe per-feature configuration; each
+// ConfigEntry is one venue we care about. Identity (Platform, Name, ID)
+// and the cross-feature settings (PartySize, City) live at the top level.
+// The Snipe and Check sub-blocks describe per-feature configuration; each
 // is independently opt-in via its presence in the JSON.
 type ConfigEntry struct {
-	Name      string       `json:"name"`
-	ID        string       `json:"id"`
-	PartySize int          `json:"party_size,omitempty"`
-	City      string       `json:"city,omitempty"` // slug; drives search bias and snipe timezone
-	Snipe     *SnipeConfig `json:"snipe,omitempty"`
-	Check     *CheckConfig `json:"check,omitempty"`
+	Name string `json:"name"`
+	// ID is the venue's platform-native identifier: a numeric id on Resy,
+	// a URL slug on SevenRooms.
+	ID string `json:"id"`
+	// Plat names the reservation platform the venue is on. An empty value
+	// means Resy, so configs written before SevenRooms support keep
+	// working unchanged. Read it through the Platform method.
+	Plat      string `json:"platform,omitempty"`
+	PartySize int    `json:"party_size,omitempty"`
+	City      string `json:"city,omitempty"` // Resy city slug; drives search bias and snipe timezone
+	// AutoBookCard lets check book this venue's card-required slots
+	// without asking first. It applies only to slots that charge nothing
+	// at booking — a slot with a real cost always goes to a human,
+	// whatever this says, so a venue that starts asking for a deposit
+	// cannot quietly start spending money. Note that "charges nothing"
+	// is not "costs nothing": these venues keep a card on file and bill
+	// it for a no-show or a late cancellation.
+	AutoBookCard bool         `json:"auto_book_card,omitempty"`
+	Snipe        *SnipeConfig `json:"snipe,omitempty"`
+	Check        *CheckConfig `json:"check,omitempty"`
+}
+
+// Platform returns the entry's reservation platform, defaulting to Resy
+// when the field is absent or unrecognized. An unrecognized value is
+// reported so callers can warn instead of silently checking the wrong
+// platform.
+func (e ConfigEntry) Platform() (platform.Platform, error) {
+	if e.Plat == "" {
+		return platform.Default, nil
+	}
+	return platform.Parse(e.Plat)
 }
 
 // SnipeConfig configures the `resz snipe` subcommand for a venue.

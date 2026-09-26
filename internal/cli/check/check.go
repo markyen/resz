@@ -10,11 +10,12 @@ import (
 	"os"
 	"time"
 
+	"resz/internal/bookflow"
 	"resz/internal/cliflag"
 	"resz/internal/notify"
+	"resz/internal/platform"
 	"resz/internal/reslog"
-	"resz/internal/resyapi"
-	"resz/internal/resyflow"
+	"resz/internal/sevenroomsapi"
 	"resz/internal/state"
 	"resz/internal/venueconfig"
 )
@@ -90,13 +91,24 @@ func Main(args []string) int {
 			lg.Printf("[%s] missing id, skipping", v.Name)
 			continue
 		}
+		p, perr := v.Platform()
+		if perr != nil {
+			lg.Printf("[%s] %v, skipping", v.Name, perr)
+			continue
+		}
 		partySize := v.PartySize
 		if partySize == 0 {
 			partySize = 2
 		}
-		lg.Printf("[%s] checking availability (id=%s party=%d)", v.Name, v.ID, partySize)
+		lg.Printf("[%s] checking availability (%s id=%s party=%d)", v.Name, p, v.ID, partySize)
 
-		dates, ferr := resyflow.FilteredDates(nil, v.ID, partySize, blackout, nil)
+		vc, verr := bookflow.Open(p, nil, v.ID, v.City, nil)
+		if verr != nil {
+			lg.Printf("[%s] venue lookup error: %v", v.Name, verr)
+			checkErr = verr
+			break
+		}
+		dates, ferr := bookflow.FilteredDates(vc, partySize, blackout, nil)
 		if ferr != nil {
 			lg.Printf("[%s] availability error: %v", v.Name, ferr)
 			checkErr = ferr
@@ -109,11 +121,11 @@ func Main(args []string) int {
 			}
 			dates = filterByDateRange(dates, r.Start, r.End)
 		}
-		var window *resyapi.Window
+		var window *platform.Window
 		if r := v.Check.TimeRange; r != nil {
-			window = &resyapi.Window{Earliest: r.Start, Latest: r.End}
+			window = &platform.Window{Earliest: r.Start, Latest: r.End}
 		}
-		_, slot, ok, ferr := resyflow.BestBookableSlot(nil, v.ID, partySize, nil, dates, window, nil)
+		_, slot, ok, ferr := bookflow.BestBookableSlot(vc, partySize, dates, window, nil)
 		if ferr != nil {
 			lg.Printf("[%s] availability error: %v", v.Name, ferr)
 			checkErr = ferr
@@ -123,11 +135,49 @@ func Main(args []string) int {
 			lg.Printf("[%s] no slots in target window", v.Name)
 			continue
 		}
-		configID := slot.Config.Token
-		lg.Printf("[%s] bookable config_id=%s; attempting booking", v.Name, configID)
-		_, berr := resyflow.AuthAndBook(nil, configID,
+		// A slot the venue will only hold against a card normally goes to
+		// a human first: the charge is real money and often
+		// non-refundable. The exception is a venue marked auto_book_card
+		// whose slot charges nothing at booking. Either way this is a
+		// skip rather than a failure, so the remaining venues still get
+		// their turn and health stays green.
+		if sevenroomsapi.IsRef(slot.Ref) {
+			if ref, perr := sevenroomsapi.ParseRef(slot.Ref); perr == nil && ref.RequiresPayment {
+				if !mayAutoBookCard(v, ref) {
+					if total := ref.ChargeTotal(); total > 0 && v.AutoBookCard {
+						// Worth saying out loud: the venue is marked for
+						// automatic booking but has started charging, so
+						// the interlock sent it to a human instead.
+						lg.Printf("[%s] auto_book_card is set but %s now charges $%.2f; asking anyway",
+							v.Name, slot.StartLabel(), total)
+					}
+					lg.Printf("[%s] %s needs a card; requesting approval", v.Name, slot.StartLabel())
+					if *notifyFlag && s.ShouldNotifyApproval(slot.Ref, now) {
+						sendApprovalRequest(lg, v.Name, slot, ref)
+					}
+					continue
+				}
+				lg.Printf("[%s] %s needs a card but charges nothing at booking; auto-booking per auto_book_card",
+					v.Name, slot.StartLabel())
+			}
+		}
+
+		lg.Printf("[%s] bookable ref=%s; attempting booking", v.Name, slot.Ref)
+		_, berr := bookflow.Book(nil, slot,
 			os.Getenv("RESY_EMAIL"), os.Getenv("RESY_PASSWORD"), nil)
 		if berr != nil {
+			// The slot needs a card and none is configured. That is not a
+			// failed run — it is the ordinary case for an install without
+			// one — so ask a human instead of failing the whole check.
+			if errors.Is(berr, sevenroomsapi.ErrPaymentRequired) {
+				lg.Printf("[%s] no card configured; falling back to approval", v.Name)
+				if ref, perr := sevenroomsapi.ParseRef(slot.Ref); perr == nil {
+					if *notifyFlag && s.ShouldNotifyApproval(slot.Ref, now) {
+						sendApprovalRequest(lg, v.Name, slot, ref)
+					}
+				}
+				continue
+			}
 			lg.Printf("[%s] booking error: %v", v.Name, berr)
 			checkErr = berr
 			break
@@ -135,10 +185,8 @@ func Main(args []string) int {
 		bookedVenue = v.Name
 		bookedWhen = slot.StartLabel()
 		// Block the booked date from future attempts.
-		if t, err := time.Parse("2006-01-02 15:04:05", slot.Date.Start); err == nil {
-			if d := t.Format("2006-01-02"); cfg.AddBlackout(d) {
-				lg.Printf("[%s] added %s to blackout_dates", v.Name, d)
-			}
+		if cfg.AddBlackout(slot.Date()) {
+			lg.Printf("[%s] added %s to blackout_dates", v.Name, slot.Date())
 		}
 		// Remove the booked venue from venues.json. Errors here are
 		// non-fatal — the booking is already confirmed at this point.
@@ -250,4 +298,52 @@ func trim(s string, n int) string {
 		return s
 	}
 	return s[:n] + "...(truncated)"
+}
+
+// sendApprovalRequest asks the human to authorize a card booking. The
+// message carries the amount and the exact command that books it, so a
+// reply can be acted on without anyone having to reconstruct the
+// reference by hand.
+func sendApprovalRequest(lg interface{ Printf(string, ...any) }, venue string, slot platform.Slot, ref sevenroomsapi.Ref) {
+	msg, amount := approvalMessage(venue, slot, ref)
+	switch err := notify.Send(msg); {
+	case err == nil:
+		lg.Printf("[%s] approval requested (%s)", venue, amount)
+	case errors.Is(err, notify.ErrNoTransport):
+		lg.Printf("[%s] approval needed (%s) but no notify transport is configured", venue, amount)
+	default:
+		lg.Printf("[%s] approval notify failed: %v", venue, err)
+	}
+}
+
+// approvalMessage builds the request a human answers with APPROVE, and
+// returns the amount separately for the log line. The reference is
+// included verbatim so the booking that follows cannot drift to a
+// different slot, and the amount is stated so approval is given for a
+// specific number rather than "a deposit".
+func approvalMessage(venue string, slot platform.Slot, ref sevenroomsapi.Ref) (msg, amount string) {
+	if total := ref.ChargeTotal(); total > 0 {
+		amount = fmt.Sprintf("$%.2f", total)
+		if ref.ChargeType == "person" {
+			amount += fmt.Sprintf(" ($%.2f x %d)", ref.Cost, ref.PartySize)
+		}
+	} else {
+		amount = "a card on file (no amount advertised)"
+	}
+	msg = fmt.Sprintf("%s: %s on %s needs %s.\n\nReply APPROVE to book it in the widget, or ignore this message to let it go.\n\n%s\nref: %s",
+		venue, slot.StartLabel(), ref.Date(), amount, ref.WidgetURL(), slot.Ref)
+	return msg, amount
+}
+
+// mayAutoBookCard reports whether a card-required slot can be booked
+// without asking. Both halves matter: the venue has to be marked for it,
+// and the slot has to charge nothing at booking time. The second half is
+// an interlock, not a formality — it means a venue that switches from a
+// card-on-file hold to a real deposit starts asking again on its own,
+// with no config change.
+//
+// It says nothing about what the venue may bill later. These slots keep a
+// card on file precisely so they can charge a no-show fee.
+func mayAutoBookCard(v venueconfig.ConfigEntry, ref sevenroomsapi.Ref) bool {
+	return v.AutoBookCard && ref.ChargeTotal() == 0
 }

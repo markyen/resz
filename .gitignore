@@ -12,3 +12,7 @@
 
 # Wrappers hold local credentials and environment setup
 /wrappers/
+
+# Editor swap files
+*.swp
+*.swo

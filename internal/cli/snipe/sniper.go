@@ -3,14 +3,14 @@ package snipe
 import (
 	"context"
 	"fmt"
-	"math"
 	"net/http"
 	"sort"
 	"sync"
 	"time"
 
+	"resz/internal/bookflow"
+	"resz/internal/platform"
 	"resz/internal/resyapi"
-	"resz/internal/resyflow"
 	"resz/internal/venueconfig"
 )
 
@@ -32,13 +32,13 @@ func snipeVenue(
 	authInit *resyapi.CachedAuth,
 	email, password string,
 	entry venueconfig.ConfigEntry,
-	venue *resyapi.Venue,
+	vc *resyapi.Client,
 	currentConfigID string, // for warmup; "" if none
 	targetTime time.Time,
 	partySize int,
 	blackout map[string]bool,
 	log func(string, ...any),
-) (resyapi.Slot, bool) {
+) (platform.Slot, bool) {
 	prefix := fmt.Sprintf("[%s] ", entry.Name)
 	logf := func(format string, a ...any) { log(prefix+format, a...) }
 	auth := authInit
@@ -50,7 +50,7 @@ func snipeVenue(
 		select {
 		case <-time.After(d):
 		case <-ctx.Done():
-			return resyapi.Slot{}, false
+			return platform.Slot{}, false
 		}
 	}
 
@@ -106,7 +106,7 @@ func snipeVenue(
 		select {
 		case <-time.After(d):
 		case <-ctx.Done():
-			return resyapi.Slot{}, false
+			return platform.Slot{}, false
 		}
 	}
 
@@ -116,10 +116,10 @@ func snipeVenue(
 	deadline := targetTime.Add(10 * time.Second)
 	tctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	slot, bookErr := snipeLoop(tctx, client, auth, email, password, entry, venue, targetDate, targetTime.Location(), partySize, blackout, logf)
+	slot, bookErr := snipeLoop(tctx, client, auth, email, password, entry, vc, targetDate, targetTime.Location(), partySize, blackout, logf)
 	if bookErr != nil {
 		logf("done without booking: %v", bookErr)
-		return resyapi.Slot{}, false
+		return platform.Slot{}, false
 	}
 	return slot, true
 }
@@ -137,15 +137,15 @@ func snipeLoop(
 	auth *resyapi.CachedAuth,
 	email, password string,
 	entry venueconfig.ConfigEntry,
-	venue *resyapi.Venue,
+	vc *resyapi.Client,
 	targetDate string,
 	loc *time.Location,
 	partySize int,
 	blackout map[string]bool,
 	logf func(string, ...any),
-) (resyapi.Slot, error) {
+) (platform.Slot, error) {
 	type prep struct {
-		slot      resyapi.Slot
+		slot      platform.Slot
 		date      string
 		bookToken string
 		err       error
@@ -179,23 +179,23 @@ func snipeLoop(
 	// slotsByDate caches /4/find results per date; lazy-fetched on first use.
 	var (
 		slotsMu     sync.Mutex
-		slotsByDate = map[string][]resyapi.Slot{}
+		slotsByDate = map[string][]platform.Slot{}
 		triedMu     sync.Mutex
 		tried       = map[string]bool{}
 	)
 
-	getSlots := func(d string) ([]resyapi.Slot, error) {
+	getSlots := func(d string) ([]platform.Slot, error) {
 		slotsMu.Lock()
 		if s, ok := slotsByDate[d]; ok {
 			slotsMu.Unlock()
 			return s, nil
 		}
 		slotsMu.Unlock()
-		slots, err := resyapi.SlotsInWindow(client, entry.ID, d, partySize, venue, nil, nil)
+		slots, err := bookflow.SlotsInWindow(vc, d, partySize, nil, nil)
 		if err != nil {
 			return nil, err
 		}
-		sortByPreference(slots, resyflow.PreferredTime)
+		platform.SortByPreference(slots, bookflow.PreferredTime)
 		slotsMu.Lock()
 		slotsByDate[d] = slots
 		slotsMu.Unlock()
@@ -211,7 +211,7 @@ func snipeLoop(
 	// pickNext returns the next-best (date, slot) across dateOrder,
 	// skipping anything already in `tried`. Does NOT mark the returned
 	// slot as tried — the caller does that to coordinate prefetch.
-	pickNext := func() (string, resyapi.Slot, bool) {
+	pickNext := func() (string, platform.Slot, bool) {
 		for _, d := range dateOrder {
 			slots, err := getSlots(d)
 			if err != nil {
@@ -220,14 +220,14 @@ func snipeLoop(
 			}
 			triedMu.Lock()
 			for _, s := range slots {
-				if !tried[s.Config.Token] {
+				if !tried[s.Ref] {
 					triedMu.Unlock()
 					return d, s, true
 				}
 			}
 			triedMu.Unlock()
 		}
-		return "", resyapi.Slot{}, false
+		return "", platform.Slot{}, false
 	}
 
 	fetchPrep := func() prep {
@@ -235,9 +235,9 @@ func snipeLoop(
 		if !ok {
 			return prep{err: fmt.Errorf("no untried slots across %d dates", len(dateOrder))}
 		}
-		bt, err := resyapi.Details(client, auth.Token, s.Config.Token, nil)
+		bt, err := resyapi.Details(client, auth.Token, s.Ref, nil)
 		if err != nil {
-			markTried(s.Config.Token)
+			markTried(s.Ref)
 			return prep{slot: s, date: d, err: fmt.Errorf("details: %w", err)}
 		}
 		return prep{slot: s, date: d, bookToken: bt}
@@ -260,14 +260,14 @@ func snipeLoop(
 		}
 	}
 	if cur.err != nil {
-		return resyapi.Slot{}, cur.err
+		return platform.Slot{}, cur.err
 	}
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return resyapi.Slot{}, err
+			return platform.Slot{}, err
 		}
-		logf("attempt %s slot %s -> Book", cur.date, cur.slot.Date.Start)
+		logf("attempt %s slot %s -> Book", cur.date, cur.slot.StartLabel())
 
 		// Fire Book in a goroutine.
 		bookCh := make(chan error, 1)
@@ -277,7 +277,7 @@ func snipeLoop(
 		}(cur.bookToken)
 
 		// Mark current slot as tried so the prefetch picks something else.
-		markTried(cur.slot.Config.Token)
+		markTried(cur.slot.Ref)
 		nextCh := make(chan prep, 1)
 		go func() { nextCh <- fetchPrep() }()
 
@@ -286,50 +286,26 @@ func snipeLoop(
 		select {
 		case bookErr = <-bookCh:
 		case <-ctx.Done():
-			return resyapi.Slot{}, ctx.Err()
+			return platform.Slot{}, ctx.Err()
 		}
 
 		if bookErr == nil {
-			logf("BOOKED %s at %s", entry.Name, cur.slot.Date.Start)
+			logf("BOOKED %s at %s", entry.Name, cur.slot.StartLabel())
 			return cur.slot, nil
 		}
-		logf("book failed for %s %s: %v", cur.date, cur.slot.Date.Start, bookErr)
+		logf("book failed for %s %s: %v", cur.date, cur.slot.StartLabel(), bookErr)
 
 		// Drain prefetch result so the goroutine doesn't leak.
 		var next prep
 		select {
 		case next = <-nextCh:
 		case <-ctx.Done():
-			return resyapi.Slot{}, ctx.Err()
+			return platform.Slot{}, ctx.Err()
 		}
 		if next.err != nil {
 			logf("prefetch failed: %v", next.err)
-			return resyapi.Slot{}, next.err
+			return platform.Slot{}, next.err
 		}
 		cur = next
-	}
-}
-
-func sortByPreference(slots []resyapi.Slot, preferred string) {
-	type scored struct {
-		s     resyapi.Slot
-		delta int64
-	}
-	scoredSlots := make([]scored, 0, len(slots))
-	for _, s := range slots {
-		// Unparseable starts sort last but are kept, so scoredSlots always
-		// has the same length as slots and the write-back below covers every
-		// element (no stale duplicates left in the tail).
-		delta := int64(math.MaxInt64)
-		if t, err := time.Parse("2006-01-02 15:04:05", s.Date.Start); err == nil {
-			date := t.Format("2006-01-02")
-			target, _ := time.Parse("2006-01-02 15:04", date+" "+preferred)
-			delta = int64(math.Abs(float64(t.Sub(target))))
-		}
-		scoredSlots = append(scoredSlots, scored{s, delta})
-	}
-	sort.Slice(scoredSlots, func(i, j int) bool { return scoredSlots[i].delta < scoredSlots[j].delta })
-	for i, sc := range scoredSlots {
-		slots[i] = sc.s
 	}
 }

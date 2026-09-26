@@ -7,8 +7,9 @@ import (
 	"os"
 	"strings"
 
+	"resz/internal/bookflow"
 	"resz/internal/cliflag"
-	"resz/internal/resyflow"
+	"resz/internal/sevenroomsapi"
 )
 
 var verbose bool
@@ -33,8 +34,12 @@ func Main(args []string) int {
 	verboseFlag := fs.Bool("v", false, "print URLs and full response bodies on errors")
 	emailFlag := fs.String("e", os.Getenv("RESY_EMAIL"), "email for token refresh (defaults to $RESY_EMAIL)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: resz book [-v] [-e EMAIL] <rgs://config_id>\n")
-		fmt.Fprintln(os.Stderr, "Token is loaded from cache or refreshed; password is read from $RESY_PASSWORD.")
+		fmt.Fprintf(os.Stderr, "usage: resz book [-v] [-e EMAIL] <rgs://config_id | sr://...>\n")
+		fmt.Fprintln(os.Stderr, "Books a slot reference printed by `resz availability`.")
+		fmt.Fprintln(os.Stderr, "  rgs:// (Resy)       token is loaded from cache or refreshed;")
+		fmt.Fprintln(os.Stderr, "                      the password is read from $RESY_PASSWORD.")
+		fmt.Fprintln(os.Stderr, "  sr://  (SevenRooms) guest checkout; the diner's details are read")
+		fmt.Fprintln(os.Stderr, "                      from config/account.json.")
 		cliflag.PrintDefaults(fs)
 	}
 	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
@@ -46,13 +51,21 @@ func Main(args []string) int {
 		fs.Usage()
 		return 2
 	}
-	configID := fs.Arg(0)
-	if !strings.HasPrefix(configID, "rgs://") {
-		fmt.Fprintln(os.Stderr, "error: argument must be an rgs:// config_id")
+	ref := fs.Arg(0)
+
+	var (
+		body []byte
+		err  error
+	)
+	switch {
+	case sevenroomsapi.IsRef(ref):
+		body, err = bookflow.BookSevenRooms(nil, ref, vlogger())
+	case strings.HasPrefix(ref, "rgs://"):
+		body, err = bookflow.AuthAndBook(nil, ref, *emailFlag, os.Getenv("RESY_PASSWORD"), vlogger())
+	default:
+		fmt.Fprintln(os.Stderr, "error: argument must be an rgs:// (Resy) or sr:// (SevenRooms) slot reference")
 		return 2
 	}
-
-	body, err := resyflow.AuthAndBook(nil, configID, *emailFlag, os.Getenv("RESY_PASSWORD"), vlogger())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, trimErr(err))
 		if verbose && body != nil {

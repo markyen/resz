@@ -12,10 +12,12 @@ import (
 	"sync"
 	"time"
 
+	"resz/internal/bookflow"
 	"resz/internal/cliflag"
 	"resz/internal/notify"
+	"resz/internal/platform"
 	"resz/internal/resyapi"
-	"resz/internal/resyflow"
+	"resz/internal/sevenroomsapi"
 	"resz/internal/venueconfig"
 )
 
@@ -98,7 +100,22 @@ func Main(args []string) int {
 		if e.ID == "" {
 			continue
 		}
+		p, err := e.Platform()
+		if err != nil {
+			logf("entry %q: %v", e.Name, err)
+			continue
+		}
 		loc := locFromCity(e.City)
+		if p == platform.SevenRooms {
+			// SevenRooms reports each venue's own timezone, so a target
+			// time is interpreted there rather than via the Resy city
+			// slug. The lookup is one cheap request during scheduling.
+			if vc, verr := sevenroomsapi.Open(nil, e.ID, nil); verr == nil {
+				loc = vc.Location()
+			} else {
+				logf("entry %q: venue lookup failed (%v); interpreting target_time in %s", e.Name, verr, loc)
+			}
+		}
 		tt, err := nextTargetTime(e.Snipe.TargetTime, now, loc)
 		if err != nil {
 			logf("entry %q: bad target_time %q: %v", e.Name, e.Snipe.TargetTime, err)
@@ -122,20 +139,51 @@ func Main(args []string) int {
 
 	client := newSharedClient()
 
-	auth, err := resyapi.EnsureAuth(*emailFlag, os.Getenv("RESY_PASSWORD"), vloggerFunc())
-	if err != nil {
-		logf("auth: %v", err)
-		return 1
+	// Credentials are only demanded for platforms actually scheduled, so
+	// a SevenRooms-only config never fails for want of $RESY_PASSWORD and
+	// vice versa.
+	scheduledOn := map[platform.Platform]bool{}
+	for _, s := range todo {
+		p, _ := s.entry.Platform()
+		scheduledOn[p] = true
 	}
 
-	// Per-venue warmup prep (parallel).
+	var auth *resyapi.CachedAuth
+	if scheduledOn[platform.Resy] {
+		a, err := resyapi.EnsureAuth(*emailFlag, os.Getenv("RESY_PASSWORD"), vloggerFunc())
+		if err != nil {
+			logf("auth: %v", err)
+			return 1
+		}
+		auth = a
+	}
+
+	// Reading the guest details now turns a misconfiguration into an
+	// error before the sleep rather than after it.
+	var guest sevenroomsapi.Guest
+	if scheduledOn[platform.SevenRooms] {
+		g, err := bookflow.SevenRoomsGuest()
+		if err != nil {
+			logf("sevenrooms account: %v", err)
+			return 1
+		}
+		guest = g
+	}
+
+	// Per-venue warmup prep (parallel). Only Resy needs it: its snipe
+	// path prefetches a book_token, so the TLS/HTTP-2 connection and the
+	// venue's geo metadata are worth having in hand before the drop.
 	prepared := make([]struct {
 		s               scheduled
-		venue           *resyapi.Venue
+		vc              *resyapi.Client
 		currentConfigID string
 	}, len(todo))
 	var prepWg sync.WaitGroup
 	for i, s := range todo {
+		prepared[i].s = s
+		if p, _ := s.entry.Platform(); p != platform.Resy {
+			continue
+		}
 		prepWg.Add(1)
 		go func(i int, s scheduled) {
 			defer prepWg.Done()
@@ -144,18 +192,18 @@ func Main(args []string) int {
 				logf("[%s] GetVenue: %v", s.entry.Name, err)
 				return
 			}
+			vc := resyapi.NewClient(client, s.entry.ID, s.entry.City, v)
 			partySize := s.entry.PartySize
 			if partySize == 0 {
 				partySize = defaultPartySize
 			}
-			cfgID := warmupConfigID(client, s.entry.ID, partySize, v, blackout)
+			cfgID := warmupConfigID(vc, partySize, blackout)
 			if cfgID != "" {
 				logf("[%s] warmup config_id available: %s", s.entry.Name, cfgID)
 			} else {
 				vlog(fmt.Sprintf("[%s] no current availability for warmup", s.entry.Name))
 			}
-			prepared[i].s = s
-			prepared[i].venue = v
+			prepared[i].vc = vc
 			prepared[i].currentConfigID = cfgID
 		}(i, s)
 	}
@@ -165,7 +213,7 @@ func Main(args []string) int {
 	type bookedResult struct {
 		venueID string
 		name    string
-		slot    resyapi.Slot
+		slot    platform.Slot
 	}
 	var (
 		bookedMu sync.Mutex
@@ -175,8 +223,9 @@ func Main(args []string) int {
 	defer cancel()
 	var wg sync.WaitGroup
 	for _, p := range prepared {
-		if p.venue == nil {
-			continue
+		plat, _ := p.s.entry.Platform()
+		if plat == platform.Resy && p.vc == nil {
+			continue // prep failed; it already logged why
 		}
 		partySize := p.s.entry.PartySize
 		if partySize == 0 {
@@ -185,12 +234,22 @@ func Main(args []string) int {
 		wg.Add(1)
 		go func(p struct {
 			s               scheduled
-			venue           *resyapi.Venue
+			vc              *resyapi.Client
 			currentConfigID string
-		}, partySize int) {
+		}, plat platform.Platform, partySize int) {
 			defer wg.Done()
-			slot, ok := snipeVenue(ctx, client, auth, *emailFlag, os.Getenv("RESY_PASSWORD"),
-				p.s.entry, p.venue, p.currentConfigID, p.s.targetTime, partySize, blackout, logf)
+			var (
+				slot platform.Slot
+				ok   bool
+			)
+			switch plat {
+			case platform.Resy:
+				slot, ok = snipeVenue(ctx, client, auth, *emailFlag, os.Getenv("RESY_PASSWORD"),
+					p.s.entry, p.vc, p.currentConfigID, p.s.targetTime, partySize, blackout, logf)
+			case platform.SevenRooms:
+				slot, ok = snipeSevenRooms(ctx, client, guest, p.s.entry,
+					p.s.targetTime, partySize, blackout, logf)
+			}
 			if !ok {
 				return
 			}
@@ -198,7 +257,7 @@ func Main(args []string) int {
 			booked = append(booked, bookedResult{venueID: p.s.entry.ID, name: p.s.entry.Name, slot: slot})
 			bookedMu.Unlock()
 			notifyBooking(p.s.entry.Name, slot)
-		}(p, partySize)
+		}(p, plat, partySize)
 	}
 	wg.Wait()
 
@@ -208,10 +267,8 @@ func Main(args []string) int {
 		bookedIDs := make(map[string]bool, len(booked))
 		for _, b := range booked {
 			bookedIDs[b.venueID] = true
-			if t, err := time.Parse("2006-01-02 15:04:05", b.slot.Date.Start); err == nil {
-				if d := t.Format("2006-01-02"); cfg.AddBlackout(d) {
-					logf("[%s] added %s to blackout_dates", b.name, d)
-				}
+			if cfg.AddBlackout(b.slot.Date()) {
+				logf("[%s] added %s to blackout_dates", b.name, b.slot.Date())
 			}
 		}
 		out := cfg.Venues[:0]
@@ -234,7 +291,7 @@ func Main(args []string) int {
 
 // notifyBooking sends a per-venue booking confirmation via the
 // configured notify transport. Missing transport is logged and skipped.
-func notifyBooking(venueName string, slot resyapi.Slot) {
+func notifyBooking(venueName string, slot platform.Slot) {
 	msg := fmt.Sprintf("booked %s for %s", venueName, slot.StartLabel())
 	err := notify.Send(msg)
 	switch {
@@ -277,16 +334,16 @@ func nextTargetTime(hm string, now time.Time, loc *time.Location) (time.Time, er
 // warmupConfigID looks for an already-bookable slot we can use to warm
 // up the HTTP/2 connection during pre-snipe prep. Errors are swallowed
 // (best-effort); a "" return means use the fallback /3/venue warmup.
-func warmupConfigID(client *http.Client, venueID string, partySize int, venue *resyapi.Venue, blackout map[string]bool) string {
-	dates, err := resyflow.FilteredDates(client, venueID, partySize, blackout, nil)
+func warmupConfigID(vc *resyapi.Client, partySize int, blackout map[string]bool) string {
+	dates, err := bookflow.FilteredDates(vc, partySize, blackout, nil)
 	if err != nil {
 		return ""
 	}
-	_, slot, ok, err := resyflow.BestBookableSlot(client, venueID, partySize, venue, dates, nil, nil)
+	_, slot, ok, err := bookflow.BestBookableSlot(vc, partySize, dates, nil, nil)
 	if err != nil || !ok {
 		return ""
 	}
-	return slot.Config.Token
+	return slot.Ref
 }
 
 func newSharedClient() *http.Client {

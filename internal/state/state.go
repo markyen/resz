@@ -32,6 +32,40 @@ type State struct {
 	ErrorCount        int         `json:"error_count"`
 	CurrentBackoffSec int         `json:"current_backoff_seconds"`
 	Health            HealthState `json:"health"`
+
+	// ApprovalNotified remembers when each card-required slot was last
+	// sent for approval, keyed by its booking reference. check runs every
+	// half hour and a card slot can sit unbooked for days, so without
+	// this the same slot would be messaged over and over.
+	ApprovalNotified map[string]time.Time `json:"approval_notified,omitempty"`
+}
+
+// ApprovalCooldown is how long to stay quiet about a slot already sent
+// for approval. Long enough not to nag, short enough that a slot still
+// sitting there tomorrow gets raised again.
+const ApprovalCooldown = 12 * time.Hour
+
+// approvalRetention bounds the map: a reference nobody acted on is worth
+// forgetting once its date is well past.
+const approvalRetention = 14 * 24 * time.Hour
+
+// ShouldNotifyApproval reports whether ref is due an approval message,
+// recording the decision when it is. It also prunes references old
+// enough that they cannot still be relevant.
+func (s *State) ShouldNotifyApproval(ref string, now time.Time) bool {
+	if s.ApprovalNotified == nil {
+		s.ApprovalNotified = make(map[string]time.Time)
+	}
+	for k, t := range s.ApprovalNotified {
+		if now.Sub(t) > approvalRetention {
+			delete(s.ApprovalNotified, k)
+		}
+	}
+	if last, ok := s.ApprovalNotified[ref]; ok && now.Sub(last) < ApprovalCooldown {
+		return false
+	}
+	s.ApprovalNotified[ref] = now
+	return true
 }
 
 // Path returns the on-disk location of state.json, under the workspace's

@@ -9,9 +9,10 @@ import (
 	"strconv"
 	"strings"
 
+	"resz/internal/bookflow"
 	"resz/internal/cliflag"
+	"resz/internal/platform"
 	"resz/internal/resyapi"
-	"resz/internal/resyflow"
 	"resz/internal/venueconfig"
 )
 
@@ -51,13 +52,16 @@ func Main(args []string) int {
 	fs.SetOutput(os.Stderr)
 	partySizeFlag := fs.Int("s", 2, "party size (number of seats; per-venue config value takes priority)")
 	interactive := fs.Bool("i", false, "interactively choose a slot (single-venue mode only)")
-	name := fs.String("n", "", "restaurant name to look up via search (instead of a venue_id)")
+	name := fs.String("n", "", "restaurant name to look up via search (instead of a venue id)")
 	cityFlag := fs.String("city", resyapi.DefaultCity, "city slug to bias name search (only used with -n)")
+	platformFlag := fs.String("platform", string(platform.Default), "platform of the given venue id: "+strings.Join(platform.Names(), ", "))
 	verboseFlag := fs.Bool("v", false, "print URLs and full response bodies on errors")
 	configFlag := fs.String("c", "", "snipe config file (provides venues and blackout_dates)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: resz availability [-s N] [-i] [-v] [--city SLUG] [-c CONFIG] (-n <name> | <venue_id> | (config venues))\n")
-		fmt.Fprintln(os.Stderr, "  With no name or venue_id, checks all venues in the config file.")
+		fmt.Fprintf(os.Stderr, "usage: resz availability [-s N] [-i] [-v] [--platform NAME] [--city SLUG] [-c CONFIG] (-n <name> | <venue_id> | (config venues))\n")
+		fmt.Fprintln(os.Stderr, "  With no name or venue id, checks all venues in the config file.")
+		fmt.Fprintln(os.Stderr, "  A venue id is numeric on Resy and a booking-URL slug on SevenRooms;")
+		fmt.Fprintln(os.Stderr, "  a full SevenRooms reservation URL works too.")
 		cliflag.PrintDefaults(fs)
 	}
 	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
@@ -76,7 +80,7 @@ func Main(args []string) int {
 		blackout = venueconfig.BlackoutSet(cfg.BlackoutDates)
 	}
 
-	// Config mode: no name or venue_id given — check all venues from config.
+	// Config mode: no name or venue id given — check all venues from config.
 	if *name == "" && fs.NArg() == 0 {
 		if cfg == nil || len(cfg.Venues) == 0 {
 			fs.Usage()
@@ -87,49 +91,76 @@ func Main(args []string) int {
 				fmt.Fprintf(os.Stderr, "[%s] no id in config, skipping\n", v.Name)
 				continue
 			}
+			p, err := v.Platform()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[%s] %v, skipping\n", v.Name, err)
+				continue
+			}
 			partySize := v.PartySize
 			if partySize == 0 {
 				partySize = *partySizeFlag
 			}
-			fmt.Fprintf(os.Stderr, "=== %s (id %s, party %d) ===\n", v.Name, v.ID, partySize)
-			checkVenue(v.ID, partySize, blackout)
+			fmt.Fprintf(os.Stderr, "=== %s (%s id %s, party %d) ===\n", v.Name, p, v.ID, partySize)
+			checkVenue(p, v.ID, v.City, partySize, blackout)
 		}
 		return 0
 	}
 
 	// Single-venue mode.
 	if *name != "" && fs.NArg() > 0 {
-		fmt.Fprintln(os.Stderr, "specify -n NAME or a venue_id, not both")
+		fmt.Fprintln(os.Stderr, "specify -n NAME or a venue id, not both")
 		return 2
 	}
 
-	var venueID string
+	city, ok := resyapi.LookupCity(*cityFlag)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "unknown city %q\n", *cityFlag)
+		return 2
+	}
+
+	var (
+		venueID string
+		p       platform.Platform
+	)
 	switch {
 	case *name != "":
-		city, ok := resyapi.LookupCity(*cityFlag)
-		if !ok {
-			fmt.Fprintf(os.Stderr, "unknown city %q\n", *cityFlag)
-			return 2
-		}
-		id, resolved, err := resolveByName(*name, city)
+		hit, err := resolveByName(*name, city)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "search:", err)
 			return 1
 		}
-		fmt.Fprintf(os.Stderr, "resolved %q to %s (id %s)\n", *name, resolved, id)
-		venueID = id
+		fmt.Fprintf(os.Stderr, "resolved %q to %s (%s id %s)\n", *name, hit.Name, hit.Platform, hit.ID)
+		venueID, p = hit.ID, hit.Platform
 	case fs.NArg() == 1:
 		venueID = fs.Arg(0)
-		if _, err := strconv.Atoi(venueID); err != nil {
-			fmt.Fprintln(os.Stderr, "venue_id must be numeric")
+		parsed, err := platform.Parse(*platformFlag)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
 			return 2
+		}
+		p = parsed
+		if p == platform.Resy {
+			if _, err := strconv.Atoi(venueID); err != nil {
+				fmt.Fprintln(os.Stderr, "a Resy venue_id must be numeric (use --platform sevenrooms for a SevenRooms slug)")
+				return 2
+			}
 		}
 	default:
 		fs.Usage()
 		return 2
 	}
 
-	dates, err := resyflow.FilteredDates(nil, venueID, *partySizeFlag, blackout, vlogger())
+	vc, err := bookflow.Open(p, nil, venueID, city.Slug, vlogger())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "venue:", err)
+		return 1
+	}
+	if verbose {
+		fmt.Fprintf(os.Stderr, "venue: platform=%s id=%s name=%q timezone=%s\n",
+			vc.Platform(), vc.ID(), vc.Name(), vc.Timezone())
+	}
+
+	dates, err := bookflow.FilteredDates(vc, *partySizeFlag, blackout, vlogger())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "calendar:", err)
 		return 1
@@ -139,21 +170,11 @@ func Main(args []string) int {
 		return 1
 	}
 
-	venue, err := resyapi.GetVenue(nil, venueID)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "venue:", err)
-		return 1
-	}
-	if verbose {
-		fmt.Fprintf(os.Stderr, "venue location: code=%s lat=%s long=%s\n",
-			venue.Location.Code, venue.LatString(), venue.LongString())
-	}
-
 	if *interactive {
-		return runInteractive(venueID, *partySizeFlag, dates, venue)
+		return runInteractive(vc, *partySizeFlag, dates)
 	}
 
-	date, slot, ok, err := resyflow.BestBookableSlot(nil, venueID, *partySizeFlag, venue, dates, nil, vlogger())
+	date, slot, ok, err := bookflow.BestBookableSlot(vc, *partySizeFlag, dates, nil, vlogger())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -162,14 +183,19 @@ func Main(args []string) int {
 		fmt.Fprintln(os.Stderr, "no slots in target window on any available date")
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "selected %s at %s\n", date, slot.Date.Start)
-	fmt.Println(slot.Config.Token)
+	fmt.Fprintf(os.Stderr, "selected %s at %s\n", date, slot.StartLabel())
+	fmt.Println(slot.Ref)
 	return 0
 }
 
 // checkVenue prints the best available slot for a venue (config mode).
-func checkVenue(venueID string, partySize int, blackout map[string]bool) {
-	dates, err := resyflow.FilteredDates(nil, venueID, partySize, blackout, vlogger())
+func checkVenue(p platform.Platform, venueID, citySlug string, partySize int, blackout map[string]bool) {
+	vc, err := bookflow.Open(p, nil, venueID, citySlug, vlogger())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  venue lookup: %v\n", err)
+		return
+	}
+	dates, err := bookflow.FilteredDates(vc, partySize, blackout, vlogger())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  calendar: %v\n", err)
 		return
@@ -178,12 +204,7 @@ func checkVenue(venueID string, partySize int, blackout map[string]bool) {
 		fmt.Fprintln(os.Stderr, "  no dates with availability")
 		return
 	}
-	venue, err := resyapi.GetVenue(nil, venueID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  venue lookup: %v\n", err)
-		return
-	}
-	date, slot, ok, err := resyflow.BestBookableSlot(nil, venueID, partySize, venue, dates, nil, vlogger())
+	date, slot, ok, err := bookflow.BestBookableSlot(vc, partySize, dates, nil, vlogger())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  %v\n", err)
 		return
@@ -192,24 +213,20 @@ func checkVenue(venueID string, partySize int, blackout map[string]bool) {
 		fmt.Fprintln(os.Stderr, "  no slots in target window")
 		return
 	}
-	fmt.Fprintf(os.Stderr, "selected %s at %s\n", date, slot.Date.Start)
-	fmt.Println(slot.Config.Token)
+	fmt.Fprintf(os.Stderr, "selected %s at %s\n", date, slot.StartLabel())
+	fmt.Println(slot.Ref)
 }
 
 const maxInteractiveOptions = 50
 
-func runInteractive(venueID string, partySize int, dates []string, venue *resyapi.Venue) int {
-	type listed struct {
-		date string
-		s    resyapi.Slot
-	}
-	var all []listed
+func runInteractive(vc platform.VenueClient, partySize int, dates []string) int {
+	var all []platform.Slot
 	truncated := false
 collect:
 	for _, date := range dates {
-		slots, err := resyapi.SlotsInWindow(nil, venueID, date, partySize, venue, nil, vlogger())
+		slots, err := bookflow.SlotsInWindow(vc, date, partySize, nil, vlogger())
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "find %s: %v\n", date, err)
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 			continue
 		}
 		for _, s := range slots {
@@ -217,7 +234,7 @@ collect:
 				truncated = true
 				break collect
 			}
-			all = append(all, listed{date, s})
+			all = append(all, s)
 		}
 	}
 	if len(all) == 0 {
@@ -225,12 +242,12 @@ collect:
 		return 1
 	}
 
-	for i, l := range all {
-		label := l.s.Config.Type
+	for i, s := range all {
+		label := s.Label
 		if label != "" {
 			label = " (" + label + ")"
 		}
-		fmt.Fprintf(os.Stderr, "[%d] %s%s\n", i+1, l.s.Date.Start, label)
+		fmt.Fprintf(os.Stderr, "[%d] %s%s\n", i+1, s.StartLabel(), label)
 	}
 	if truncated {
 		fmt.Fprintf(os.Stderr, "(truncated to first %d slots; more are available)\n", maxInteractiveOptions)
@@ -247,17 +264,20 @@ collect:
 		fmt.Fprintln(os.Stderr, "invalid selection")
 		return 1
 	}
-	fmt.Println(all[n-1].s.Config.Token)
+	fmt.Println(all[n-1].Ref)
 	return 0
 }
 
-func resolveByName(name string, city *resyapi.City) (id, resolved string, err error) {
-	hits, err := resyapi.Search(name, city.Lat, city.Long)
-	if err != nil {
-		return "", "", err
-	}
+// resolveByName searches every platform and takes the first hit.
+func resolveByName(name string, city *resyapi.City) (platform.SearchHit, error) {
+	hits, errs := bookflow.Search(nil, platform.All(), name, city.Lat, city.Long, vlogger())
 	if len(hits) == 0 {
-		return "", "", fmt.Errorf("no results for %q", name)
+		for _, p := range platform.All() {
+			if err := errs[p]; err != nil {
+				return platform.SearchHit{}, err
+			}
+		}
+		return platform.SearchHit{}, fmt.Errorf("no results for %q", name)
 	}
-	return hits[0].ID.Resy.String(), hits[0].Name, nil
+	return hits[0], nil
 }

@@ -7,26 +7,31 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"resz/internal/platform"
 )
 
 const searchURL = BaseURL + "/3/venuesearch/search"
 
-type Hit struct {
+type hit struct {
 	Name string `json:"name"`
 	ID   struct {
 		Resy json.Number `json:"resy"`
 	} `json:"id"`
+	Location struct {
+		Name string `json:"name"`
+	} `json:"location"`
 }
 
 type searchResponse struct {
 	Search struct {
-		Hits []Hit `json:"hits"`
+		Hits []hit `json:"hits"`
 	} `json:"search"`
 }
 
 // Search runs the venuesearch query biased to the given (lat, long).
 // Most callers should pass coordinates from a City in Cities.
-func Search(query string, lat, long float64) ([]Hit, error) {
+func Search(query string, lat, long float64) ([]platform.SearchHit, error) {
 	body := map[string]any{
 		"availability": true,
 		"venue_filter": map[string]any{},
@@ -76,5 +81,14 @@ func Search(query string, lat, long float64) ([]Hit, error) {
 	if err := dec.Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
-	return out.Search.Hits, nil
+	hits := make([]platform.SearchHit, 0, len(out.Search.Hits))
+	for _, h := range out.Search.Hits {
+		hits = append(hits, platform.SearchHit{
+			Platform: platform.Resy,
+			ID:       h.ID.Resy.String(),
+			Name:     h.Name,
+			City:     h.Location.Name,
+		})
+	}
+	return hits, nil
 }
