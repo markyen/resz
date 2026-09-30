@@ -24,7 +24,7 @@ var ErrPaymentRequired = fmt.Errorf("this slot needs a card on file and none is 
 // A hold left dangling would block the table until it lapses (about five
 // minutes), so it is released on every failure path.
 func Reserve(client *http.Client, ref Ref, guest Guest, logger func(string)) (*Reservation, error) {
-	return ReserveWithCard(client, ref, guest, nil, logger)
+	return ReserveWithCard(client, ref, guest, nil, 0, logger)
 }
 
 // ReserveWithCard is Reserve for a slot the venue will only hold against
@@ -36,16 +36,23 @@ func Reserve(client *http.Client, ref Ref, guest Guest, logger func(string)) (*R
 // with the venue's publishable key. Only the resulting SetupIntent id
 // reaches SevenRooms; the card goes to Stripe and nowhere else.
 //
-// Slots that actually charge at booking are refused outright. resz only
-// stores a card against a table — spending money is a decision for a
-// person, not for a scheduled job.
-func ReserveWithCard(client *http.Client, ref Ref, guest Guest, card *cardsecret.Card, logger func(string)) (*Reservation, error) {
+// authorizedUSD is the largest charge a person has explicitly approved
+// for this one booking. Zero — what every unattended caller passes —
+// means no charge is authorized at all, so a slot wanting money is
+// refused with ErrChargeAtBooking and goes to a human. A slot charging
+// more than authorizedUSD is refused with the same error, so a price that
+// moved between approval and booking is never quietly paid.
+func ReserveWithCard(client *http.Client, ref Ref, guest Guest, card *cardsecret.Card, authorizedUSD float64, logger func(string)) (*Reservation, error) {
 	if ref.RequiresPayment {
 		if card == nil {
 			return nil, ErrPaymentRequired
 		}
-		if total := ref.ChargeTotal(); total > 0 {
-			return nil, fmt.Errorf("%w: this slot charges $%.2f at booking", ErrChargeAtBooking, total)
+		if total := ref.ChargeTotal(); total > authorizedUSD {
+			if authorizedUSD <= 0 {
+				return nil, fmt.Errorf("%w: this slot charges $%.2f at booking", ErrChargeAtBooking, total)
+			}
+			return nil, fmt.Errorf("%w: this slot charges $%.2f, above the $%.2f authorized",
+				ErrChargeAtBooking, total, authorizedUSD)
 		}
 	}
 	// party_size is optional on a ref but mandatory at the venue, and a
@@ -83,7 +90,10 @@ func ReserveWithCard(client *http.Client, ref Ref, guest Guest, card *cardsecret
 	// to release the hold, or the table stays blocked until it lapses.
 	var cardToken string
 	if ref.RequiresPayment && card != nil {
-		cardToken, err = setUpCard(client, venue, card, logger)
+		if total := ref.ChargeTotal(); total > 0 && logger != nil {
+			logger(fmt.Sprintf("charging $%.2f (authorized $%.2f)", total, authorizedUSD))
+		}
+		cardToken, err = setUpCard(client, venue, card, ref.ChargeTotal(), logger)
 		if err != nil {
 			if rerr := ReleaseHold(client, ref, hold, logger); rerr != nil && logger != nil {
 				logger("failed to release hold " + hold.ID + ": " + rerr.Error())
@@ -108,7 +118,7 @@ var ErrChargeAtBooking = fmt.Errorf("slot charges at booking")
 
 // setUpCard opens a SetupIntent on the venue and confirms the card
 // against it, returning the SetupIntent id the booking carries.
-func setUpCard(client *http.Client, venue *Venue, card *cardsecret.Card, logger func(string)) (string, error) {
+func setUpCard(client *http.Client, venue *Venue, card *cardsecret.Card, amountUSD float64, logger func(string)) (string, error) {
 	if venue == nil || venue.ID == "" {
 		return "", fmt.Errorf("cannot set up a card without the venue's internal id (venue_info lookup failed)")
 	}
@@ -116,8 +126,9 @@ func setUpCard(client *http.Client, venue *Venue, card *cardsecret.Card, logger 
 		return "", fmt.Errorf("venue %s publishes no Stripe key (payment_system %q); its card bookings have to go through the widget",
 			venue.Slug, venue.PaymentSystem)
 	}
-	// Amount 0: a card-on-file hold. A charging slot never reaches here.
-	si, err := CreateSetupIntent(client, venue.ID, 0, logger)
+	// Zero for a card-on-file hold; the slot's own total when a person has
+	// authorized the charge.
+	si, err := CreateSetupIntent(client, venue.ID, int(amountUSD), logger)
 	if err != nil {
 		return "", fmt.Errorf("setup intent: %w", err)
 	}

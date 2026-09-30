@@ -30,7 +30,7 @@ func testGuest() Guest {
 // Without a card, a card-required slot is refused exactly as before.
 func TestReserveWithoutCardStillRefuses(t *testing.T) {
 	ref := Ref{Venue: "examplevenue", TimeISO: "2026-09-26 20:45:00", PartySize: 2, RequiresPayment: true}
-	_, err := ReserveWithCard(nil, ref, testGuest(), nil, nil)
+	_, err := ReserveWithCard(nil, ref, testGuest(), nil, 0, nil)
 	if !errors.Is(err, ErrPaymentRequired) {
 		t.Fatalf("err = %v, want ErrPaymentRequired", err)
 	}
@@ -43,7 +43,7 @@ func TestReserveRefusesToSpend(t *testing.T) {
 		Venue: "paidvenue", TimeISO: "2026-09-26 17:15:00", PartySize: 2,
 		RequiresPayment: true, Cost: 50, ChargeType: "person",
 	}
-	_, err := ReserveWithCard(nil, ref, testGuest(), testCard(t), nil)
+	_, err := ReserveWithCard(nil, ref, testGuest(), testCard(t), 0, nil)
 	if !errors.Is(err, ErrChargeAtBooking) {
 		t.Fatalf("err = %v, want ErrChargeAtBooking", err)
 	}
@@ -56,7 +56,7 @@ func TestSetUpCardNeedsAGateway(t *testing.T) {
 	card := testCard(t)
 	// A venue with no Stripe key cannot be paid by resz, whatever the
 	// slot says. Other Venue is on FreedomPay and lands here.
-	_, err := setUpCard(nil, &Venue{Slug: "othervenue", ID: "abc", PaymentSystem: "FREEDOMPAY"}, card, nil)
+	_, err := setUpCard(nil, &Venue{Slug: "othervenue", ID: "abc", PaymentSystem: "FREEDOMPAY"}, card, 0, nil)
 	if err == nil || !strings.Contains(err.Error(), "no Stripe key") {
 		t.Fatalf("err = %v, want a complaint about the missing Stripe key", err)
 	}
@@ -66,7 +66,7 @@ func TestSetUpCardNeedsAGateway(t *testing.T) {
 }
 
 func TestSetUpCardNeedsVenueID(t *testing.T) {
-	_, err := setUpCard(nil, nil, testCard(t), nil)
+	_, err := setUpCard(nil, nil, testCard(t), 0, nil)
 	if err == nil || !strings.Contains(err.Error(), "internal id") {
 		t.Fatalf("err = %v, want a complaint about the missing venue id", err)
 	}
@@ -105,5 +105,63 @@ func TestConfirmationCodeIgnoresProse(t *testing.T) {
 		if got := confirmationCode([]byte(body)); got != "" {
 			t.Errorf("confirmationCode(%s) = %q, want empty", body, got)
 		}
+	}
+}
+
+// The authorization ceiling is the whole safety story for the CLI path:
+// a person names the figure they were quoted, and anything above it is
+// refused rather than quietly paid.
+func TestAuthorizedCeiling(t *testing.T) {
+	// $60 per person, party of 2 => $120.
+	ref := Ref{
+		Venue: "paidvenue", TimeISO: "2026-10-31 17:30:00", PartySize: 2,
+		RequiresPayment: true, Cost: 60, ChargeType: "person",
+	}
+	card := testCard(t)
+
+	// Authorizing less than the charge must refuse, and say both numbers.
+	_, err := ReserveWithCard(nil, ref, testGuest(), card, 100, nil)
+	if !errors.Is(err, ErrChargeAtBooking) {
+		t.Fatalf("under-authorized: err = %v, want ErrChargeAtBooking", err)
+	}
+	for _, want := range []string{"$120.00", "$100.00"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %s: %v", want, err)
+		}
+	}
+
+	// Authorizing exactly the charge clears the interlock — it then fails
+	// later, on the network, which is a different error.
+	_, err = ReserveWithCard(nil, ref, testGuest(), card, 120, nil)
+	if errors.Is(err, ErrChargeAtBooking) {
+		t.Errorf("authorizing the exact amount should clear the interlock, got %v", err)
+	}
+
+	// A price rise after approval is refused, not absorbed.
+	risen := ref
+	risen.Cost = 75 // now $150
+	_, err = ReserveWithCard(nil, risen, testGuest(), card, 120, nil)
+	if !errors.Is(err, ErrChargeAtBooking) {
+		t.Errorf("a price above the authorization must be refused, got %v", err)
+	}
+}
+
+// Unattended callers authorize nothing, so the old behaviour is intact.
+func TestZeroAuthorizationStillRefusesAnyCharge(t *testing.T) {
+	ref := Ref{
+		Venue: "paidvenue", TimeISO: "2026-10-31 17:30:00", PartySize: 2,
+		RequiresPayment: true, Cost: 1, ChargeType: "reservation",
+	}
+	if _, err := ReserveWithCard(nil, ref, testGuest(), testCard(t), 0, nil); !errors.Is(err, ErrChargeAtBooking) {
+		t.Fatalf("even $1 must be refused without authorization, got %v", err)
+	}
+}
+
+// A card-on-file slot charges nothing, so it books with no authorization.
+func TestCardOnFileNeedsNoAuthorization(t *testing.T) {
+	ref := Ref{Venue: "examplevenue", TimeISO: "2026-10-31 17:30:00", PartySize: 2, RequiresPayment: true}
+	_, err := ReserveWithCard(nil, ref, testGuest(), testCard(t), 0, nil)
+	if errors.Is(err, ErrChargeAtBooking) {
+		t.Errorf("a $0 slot should not need authorization, got %v", err)
 	}
 }

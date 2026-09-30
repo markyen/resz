@@ -33,13 +33,19 @@ func Main(args []string) int {
 	fs.SetOutput(os.Stderr)
 	verboseFlag := fs.Bool("v", false, "print URLs and full response bodies on errors")
 	emailFlag := fs.String("e", os.Getenv("RESY_EMAIL"), "email for token refresh (defaults to $RESY_EMAIL)")
+	authorizeFlag := fs.Float64("authorize", 0, "authorize a charge of up to this many dollars for this booking")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: resz book [-v] [-e EMAIL] <rgs://config_id | sr://...>\n")
+		fmt.Fprintf(os.Stderr, "usage: resz book [-v] [-e EMAIL] [--authorize N] <rgs://config_id | sr://...>\n")
 		fmt.Fprintln(os.Stderr, "Books a slot reference printed by `resz availability`.")
 		fmt.Fprintln(os.Stderr, "  rgs:// (Resy)       token is loaded from cache or refreshed;")
 		fmt.Fprintln(os.Stderr, "                      the password is read from $RESY_PASSWORD.")
 		fmt.Fprintln(os.Stderr, "  sr://  (SevenRooms) guest checkout; the diner's details are read")
 		fmt.Fprintln(os.Stderr, "                      from config/account.json.")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "A slot that charges money at booking is refused unless --authorize")
+		fmt.Fprintln(os.Stderr, "names an amount at least as large as the charge. Pass the figure you")
+		fmt.Fprintln(os.Stderr, "were quoted: if the price has moved since, the booking is refused")
+		fmt.Fprintln(os.Stderr, "rather than silently costing more.")
 		cliflag.PrintDefaults(fs)
 	}
 	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
@@ -59,7 +65,7 @@ func Main(args []string) int {
 	)
 	switch {
 	case sevenroomsapi.IsRef(ref):
-		body, err = bookflow.BookSevenRooms(nil, ref, vlogger())
+		body, err = bookflow.BookSevenRoomsAuthorized(nil, ref, *authorizeFlag, vlogger())
 	case strings.HasPrefix(ref, "rgs://"):
 		body, err = bookflow.AuthAndBook(nil, ref, *emailFlag, os.Getenv("RESY_PASSWORD"), vlogger())
 	default:
