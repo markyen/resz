@@ -78,6 +78,13 @@ func ReserveWithCard(client *http.Client, ref Ref, guest Guest, card *cardsecret
 		venue = nil
 	}
 
+	// Refuse an undrivable gateway before holding anything. Discovering it
+	// after the hold would block a real table for the five minutes it takes
+	// to lapse, for a booking that was never going to complete.
+	if err := gatewayRefusal(ref, card, venue); err != nil {
+		return nil, err
+	}
+
 	hold, err := CreateHold(client, ref, logger)
 	if err != nil {
 		return nil, fmt.Errorf("hold: %w", err)
@@ -116,6 +123,39 @@ func ReserveWithCard(client *http.Client, ref Ref, guest Guest, card *cardsecret
 // cards; it does not spend, so these are always a human's call.
 var ErrChargeAtBooking = fmt.Errorf("slot charges at booking")
 
+// ErrGatewayUnsupported marks a venue whose payment gateway resz cannot
+// drive. Only Stripe is supported, and that is unlikely to change.
+//
+// FreedomPay — the other gateway seen on SevenRooms — captures the card
+// in i4Go hosted fields served from FreedomPay's own domain, and its
+// /api-yoa/payments/<venue>/authorize call carries an invisible reCAPTCHA
+// token alongside a device risk-session id. Supplying those from a
+// non-browser client would mean defeating a bot-detection control, so
+// resz does not try. These bookings belong in the venue's widget, with a
+// person present.
+var ErrGatewayUnsupported = fmt.Errorf("payment gateway not supported; book this one in the venue's widget")
+
+// gatewayRefusal reports whether this booking is doomed by the venue's
+// payment gateway, so the caller can refuse before taking a hold. It
+// returns nil when there is nothing to pay, no card to pay with, or the
+// gateway is one resz can drive — and nil when the venue is unknown,
+// since the booking may still be a free one.
+func gatewayRefusal(ref Ref, card *cardsecret.Card, venue *Venue) error {
+	if !ref.RequiresPayment || card == nil || venue == nil || venue.TakesPayment() {
+		return nil
+	}
+	return fmt.Errorf("%w: %s is on %s", ErrGatewayUnsupported, venue.Slug, gatewayName(venue.PaymentSystem))
+}
+
+// gatewayName renders a venue's gateway for an error message, naming the
+// empty case rather than printing "".
+func gatewayName(system string) string {
+	if system == "" {
+		return "an unnamed gateway"
+	}
+	return system
+}
+
 // setUpCard opens a SetupIntent on the venue and confirms the card
 // against it, returning the SetupIntent id the booking carries.
 func setUpCard(client *http.Client, venue *Venue, card *cardsecret.Card, amountUSD float64, logger func(string)) (string, error) {
@@ -123,8 +163,7 @@ func setUpCard(client *http.Client, venue *Venue, card *cardsecret.Card, amountU
 		return "", fmt.Errorf("cannot set up a card without the venue's internal id (venue_info lookup failed)")
 	}
 	if !venue.TakesPayment() {
-		return "", fmt.Errorf("venue %s publishes no Stripe key (payment_system %q); its card bookings have to go through the widget",
-			venue.Slug, venue.PaymentSystem)
+		return "", fmt.Errorf("%w: %s is on %s, not Stripe", ErrGatewayUnsupported, venue.Slug, gatewayName(venue.PaymentSystem))
 	}
 	// Zero for a card-on-file hold; the slot's own total when a person has
 	// authorized the charge.

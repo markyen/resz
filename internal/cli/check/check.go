@@ -166,11 +166,13 @@ func Main(args []string) int {
 		_, berr := bookflow.Book(nil, slot,
 			os.Getenv("RESY_EMAIL"), os.Getenv("RESY_PASSWORD"), nil)
 		if berr != nil {
-			// The slot needs a card and none is configured. That is not a
-			// failed run — it is the ordinary case for an install without
-			// one — so ask a human instead of failing the whole check.
-			if errors.Is(berr, sevenroomsapi.ErrPaymentRequired) {
-				lg.Printf("[%s] no card configured; falling back to approval", v.Name)
+			// Two cases are a human's to handle rather than a failed run:
+			// no card is configured, or the venue is on a gateway resz
+			// cannot drive. Both ask for approval and let the rest of the
+			// venues have their turn.
+			if errors.Is(berr, sevenroomsapi.ErrPaymentRequired) ||
+				errors.Is(berr, sevenroomsapi.ErrGatewayUnsupported) {
+				lg.Printf("[%s] %v; falling back to approval", v.Name, berr)
 				if ref, perr := sevenroomsapi.ParseRef(slot.Ref); perr == nil {
 					if *notifyFlag && s.ShouldNotifyApproval(slot.Ref, now) {
 						sendApprovalRequest(lg, v.Name, slot, ref)

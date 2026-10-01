@@ -54,14 +54,28 @@ func TestReserveRefusesToSpend(t *testing.T) {
 
 func TestSetUpCardNeedsAGateway(t *testing.T) {
 	card := testCard(t)
-	// A venue with no Stripe key cannot be paid by resz, whatever the
-	// slot says. Other Venue is on FreedomPay and lands here.
+	// Only Stripe can be driven headlessly. A FreedomPay venue must say so
+	// in terms that stop a caller retrying, and send it to the widget.
 	_, err := setUpCard(nil, &Venue{Slug: "othervenue", ID: "abc", PaymentSystem: "FREEDOMPAY"}, card, 0, nil)
-	if err == nil || !strings.Contains(err.Error(), "no Stripe key") {
-		t.Fatalf("err = %v, want a complaint about the missing Stripe key", err)
+	if !errors.Is(err, ErrGatewayUnsupported) {
+		t.Fatalf("err = %v, want ErrGatewayUnsupported", err)
 	}
-	if !strings.Contains(err.Error(), "widget") {
-		t.Errorf("error should point at the browser fallback: %v", err)
+	for _, want := range []string{"FREEDOMPAY", "othervenue", "widget"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %q: %v", want, err)
+		}
+	}
+}
+
+// A venue that reports no gateway at all still produces a readable error
+// rather than naming an empty string.
+func TestSetUpCardWithUnnamedGateway(t *testing.T) {
+	_, err := setUpCard(nil, &Venue{Slug: "somewhere", ID: "abc"}, testCard(t), 0, nil)
+	if !errors.Is(err, ErrGatewayUnsupported) {
+		t.Fatalf("err = %v, want ErrGatewayUnsupported", err)
+	}
+	if strings.Contains(err.Error(), `""`) {
+		t.Errorf("empty gateway should be described, not quoted empty: %v", err)
 	}
 }
 
@@ -163,5 +177,39 @@ func TestCardOnFileNeedsNoAuthorization(t *testing.T) {
 	_, err := ReserveWithCard(nil, ref, testGuest(), testCard(t), 0, nil)
 	if errors.Is(err, ErrChargeAtBooking) {
 		t.Errorf("a $0 slot should not need authorization, got %v", err)
+	}
+}
+
+// gatewayRefusal is the guard that runs before any hold is taken, so an
+// undrivable gateway never blocks a real table for the five minutes a
+// hold takes to lapse.
+func TestGatewayRefusal(t *testing.T) {
+	card := testCard(t)
+	paid := Ref{Venue: "v", RequiresPayment: true}
+	free := Ref{Venue: "v"}
+	stripe := &Venue{Slug: "v", PaymentSystem: "STRIPE", PaymentPublicToken: "pk_live_x"}
+	freedom := &Venue{Slug: "v", PaymentSystem: "FREEDOMPAY"}
+
+	tests := []struct {
+		name   string
+		ref    Ref
+		card   *cardsecret.Card
+		venue  *Venue
+		refuse bool
+	}{
+		{"freedompay with a card", paid, card, freedom, true},
+		{"stripe with a card", paid, card, stripe, false},
+		{"freedompay but nothing to pay", free, card, freedom, false},
+		{"freedompay but no card configured", paid, nil, freedom, false},
+		{"venue unknown", paid, card, nil, false},
+	}
+	for _, tt := range tests {
+		err := gatewayRefusal(tt.ref, tt.card, tt.venue)
+		if tt.refuse && !errors.Is(err, ErrGatewayUnsupported) {
+			t.Errorf("%s: err = %v, want ErrGatewayUnsupported", tt.name, err)
+		}
+		if !tt.refuse && err != nil {
+			t.Errorf("%s: unexpected refusal %v", tt.name, err)
+		}
 	}
 }
