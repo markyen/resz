@@ -61,7 +61,7 @@ func AvailableDates(client *http.Client, venueID string, partySize int, logger f
 	q.Set("venue_id", venueID)
 
 	var out calendarResponse
-	if err := GetJSON(client, calendarURL+"?"+q.Encode(), &out, logger); err != nil {
+	if err := getJSONRetrying(client, calendarURL+"?"+q.Encode(), &out, findAttempts, logger); err != nil {
 		return nil, err
 	}
 
@@ -74,10 +74,10 @@ func AvailableDates(client *http.Client, venueID string, partySize int, logger f
 	return dates, nil
 }
 
-// findAttempts is how many times a /4/find call is tried before giving
-// up. The endpoint returns an occasional empty 500 — a few a day against
-// roughly a hundred calls — and a lost call means a missed slot, so it is
-// worth a few cheap retries.
+// findAttempts is how many times a Resy availability call is tried
+// before giving up. Both /4/find and /4/venue/calendar return an
+// occasional empty 500, and a lost call means a venue is skipped for that
+// run, so each is worth a few cheap retries.
 const findAttempts = 5
 
 // Slots returns every slot /4/find offers for the venue on `date`.
