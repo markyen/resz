@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"resz/internal/platform"
@@ -73,9 +74,17 @@ func AvailableDates(client *http.Client, venueID string, partySize int, logger f
 	return dates, nil
 }
 
+// findAttempts is how many times a /4/find call is tried before giving
+// up. The endpoint returns an occasional empty 500 — a few a day against
+// roughly a hundred calls — and a lost call means a missed slot, so it is
+// worth a few cheap retries.
+const findAttempts = 5
+
 // Slots returns every slot /4/find offers for the venue on `date`.
 // Filtering to a booking window is the caller's job — see
 // platform.FilterWindow.
+//
+// Transient 5xx responses are retried: see findAttempts.
 func Slots(client *http.Client, venueID, date string, partySize int, venue *Venue, logger func(string)) ([]platform.Slot, error) {
 	q := url.Values{}
 	q.Set("day", date)
@@ -88,7 +97,7 @@ func Slots(client *http.Client, venueID, date string, partySize int, venue *Venu
 	q.Set("venue_id", venueID)
 
 	var out findResponse
-	if err := GetJSON(client, findURL+"?"+q.Encode(), &out, logger); err != nil {
+	if err := getJSONRetrying(client, findURL+"?"+q.Encode(), &out, findAttempts, logger); err != nil {
 		return nil, err
 	}
 
@@ -139,4 +148,52 @@ func GetJSON(client *http.Client, rawURL string, out any, logger func(string)) e
 		return fmt.Errorf("http %d: %s", resp.StatusCode, snippet)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// isRetriable reports whether an error from GetJSON looks like the
+// endpoint's intermittent failure rather than a real answer. Only server
+// errors qualify: a 4xx means the request itself is wrong and retrying it
+// would just repeat the mistake.
+func isRetriable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, code := range []string{"http 500", "http 502", "http 503", "http 504"} {
+		if strings.Contains(msg, code) {
+			return true
+		}
+	}
+	return false
+}
+
+// getJSONRetrying calls GetJSON until it succeeds, the error is not
+// retriable, or attempts run out.
+//
+// The backoff starts short deliberately. snipe runs against a booking
+// window where a lost second costs the table, so waiting out a flaky
+// endpoint has to stay inside a second or so in the common case.
+func getJSONRetrying(client *http.Client, rawURL string, out any, attempts int, logger func(string)) error {
+	var err error
+	delay := 100 * time.Millisecond
+	for i := 1; i <= attempts; i++ {
+		err = GetJSON(client, rawURL, out, logger)
+		if err == nil {
+			if i > 1 && logger != nil {
+				logger(fmt.Sprintf("succeeded on attempt %d", i))
+			}
+			return nil
+		}
+		if !isRetriable(err) {
+			return err
+		}
+		if i < attempts {
+			if logger != nil {
+				logger(fmt.Sprintf("attempt %d/%d: %v; retrying in %s", i, attempts, err, delay))
+			}
+			time.Sleep(delay)
+			delay *= 2
+		}
+	}
+	return fmt.Errorf("after %d attempts: %w", attempts, err)
 }
