@@ -199,14 +199,19 @@ func Book(client *http.Client, slot platform.Slot, email, password string, logge
 // refused with ErrPaymentRequired and the caller decides what to do,
 // which for check means asking a human.
 func BookSevenRooms(client *http.Client, ref string, logger func(string)) ([]byte, error) {
-	return BookSevenRoomsAuthorized(client, ref, 0, logger)
+	res, err := BookSevenRoomsAuthorized(client, ref, 0, logger)
+	if err != nil {
+		return nil, err
+	}
+	return res.Raw, nil
 }
 
 // BookSevenRoomsAuthorized is BookSevenRooms with a ceiling on what the
 // booking may charge, in the venue's currency. Zero authorizes nothing,
 // which is what scheduled callers pass; a non-zero value comes from a
-// person who has seen the amount and approved it.
-func BookSevenRoomsAuthorized(client *http.Client, ref string, authorizedUSD float64, logger func(string)) ([]byte, error) {
+// person who has seen the amount and approved it. It returns the parsed
+// reservation, which says what was charged and under which payment.
+func BookSevenRoomsAuthorized(client *http.Client, ref string, authorizedUSD float64, logger func(string)) (*sevenroomsapi.Reservation, error) {
 	parsed, err := sevenroomsapi.ParseRef(ref)
 	if err != nil {
 		return nil, err
@@ -226,11 +231,7 @@ func BookSevenRoomsAuthorized(client *http.Client, ref string, authorizedUSD flo
 			logger("slot needs a card and none is configured: " + cerr.Error())
 		}
 	}
-	res, err := sevenroomsapi.ReserveWithCard(client, parsed, guest, card, authorizedUSD, logger)
-	if err != nil {
-		return nil, err
-	}
-	return res.Raw, nil
+	return sevenroomsapi.ReserveWithCard(client, parsed, guest, card, authorizedUSD, logger)
 }
 
 // SevenRoomsGuest reads the diner details from config/account.json and
