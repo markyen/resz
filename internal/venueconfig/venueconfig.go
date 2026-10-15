@@ -36,7 +36,7 @@ type ConfigEntry struct {
 	Plat      string `json:"platform,omitempty"`
 	PartySize int    `json:"party_size,omitempty"`
 	City      string `json:"city,omitempty"` // Resy city slug; drives search bias and snipe timezone
-	// AutoBookCard lets check book this venue's card-required slots
+	// AutoBookCard lets check and snipe book this venue's card-required slots
 	// without asking first. It applies only to slots that charge nothing
 	// at booking — a slot with a real cost always goes to a human,
 	// whatever this says, so a venue that starts asking for a deposit

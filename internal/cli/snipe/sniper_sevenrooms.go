@@ -2,14 +2,18 @@ package snipe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"time"
 
+	"resz/internal/approval"
 	"resz/internal/bookflow"
+	"resz/internal/cardsecret"
 	"resz/internal/platform"
 	"resz/internal/sevenroomsapi"
+	"resz/internal/state"
 	"resz/internal/venueconfig"
 )
 
@@ -28,6 +32,7 @@ func snipeSevenRooms(
 	ctx context.Context,
 	client *http.Client,
 	guest sevenroomsapi.Guest,
+	card *cardsecret.Card,
 	entry venueconfig.ConfigEntry,
 	targetTime time.Time,
 	partySize int,
@@ -85,12 +90,43 @@ func snipeSevenRooms(
 	tctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	slot, err := sevenRoomsSnipeLoop(tctx, client, vc, guest, targetDate, partySize, blackout, logf)
+	slot, needsApproval, err := sevenRoomsSnipeLoop(tctx, client, vc, guest, card, entry, targetDate, partySize, blackout, logf)
 	if err != nil {
 		logf("done without booking: %v", err)
+		// Nothing resz could book alone, but a card slot it passed over is
+		// worth a person's decision — and slots at a drop go in minutes,
+		// so ask now rather than leaving it to check's next pass.
+		if needsApproval != nil {
+			requestApproval(client, entry.Name, *needsApproval, logf)
+		}
 		return platform.Slot{}, false
 	}
 	return slot, true
+}
+
+// requestApproval asks a person to approve a card slot, unless it was
+// asked about recently. The cooldown is the one check keeps, in the same
+// state file, so the two never ask twice about one slot.
+func requestApproval(client *http.Client, venue string, slot platform.Slot, logf func(string, ...any)) {
+	ref, err := sevenroomsapi.ParseRef(slot.Ref)
+	if err != nil {
+		logf("approval for %s: %v", slot.Ref, err)
+		return
+	}
+	// A state file that can't be read is no reason to stay quiet: a
+	// duplicate request is cheaper than a missed slot.
+	if st, err := state.Load(); err != nil {
+		logf("state load: %v (asking anyway)", err)
+	} else {
+		if !st.ShouldNotifyApproval(slot.Ref, time.Now()) {
+			logf("%s needs approval; already asked within %s", slot.StartLabel(), state.ApprovalCooldown)
+			return
+		}
+		if err := state.Save(st); err != nil {
+			logf("state save: %v", err)
+		}
+	}
+	approval.Send(logger, client, venue, slot, ref)
 }
 
 // sevenRoomsSnipeLoop tries the target date first, then any other
@@ -100,16 +136,31 @@ func snipeSevenRooms(
 // Every attempt re-reads availability rather than trusting a cached view:
 // at a drop the whole day's inventory appears at once, and a slot list
 // fetched even seconds earlier is likely to be empty or stale.
+//
+// A slot that needs a card is booked only when the venue is marked
+// auto_book_card and the slot charges nothing, as in check. Otherwise it
+// is passed over in favour of a slot resz can book alone, and the best one
+// passed over comes back as needsApproval for the caller to ask about.
 func sevenRoomsSnipeLoop(
 	ctx context.Context,
 	client *http.Client,
 	vc *sevenroomsapi.Client,
 	guest sevenroomsapi.Guest,
+	card *cardsecret.Card,
+	entry venueconfig.ConfigEntry,
 	targetDate string,
 	partySize int,
 	blackout map[string]bool,
 	logf func(string, ...any),
-) (platform.Slot, error) {
+) (booked platform.Slot, needsApproval *platform.Slot, err error) {
+	// passOver remembers the first (so best) card slot that needs a
+	// person.
+	passOver := func(s platform.Slot, why string) {
+		logf("passing over %s: %s", s.StartLabel(), why)
+		if needsApproval == nil {
+			needsApproval = &s
+		}
+	}
 	dateOrder := []string{targetDate}
 	if blackout[targetDate] {
 		logf("target date %s is blacked out; falling back to other dates", targetDate)
@@ -128,14 +179,14 @@ func sevenRoomsSnipeLoop(
 		logf("available dates: %v (continuing with the target date only)", err)
 	}
 	if len(dateOrder) == 0 {
-		return platform.Slot{}, fmt.Errorf("no candidate dates")
+		return platform.Slot{}, nil, fmt.Errorf("no candidate dates")
 	}
 
 	tried := map[string]bool{}
 	for _, date := range dateOrder {
 		for {
 			if err := ctx.Err(); err != nil {
-				return platform.Slot{}, err
+				return platform.Slot{}, needsApproval, err
 			}
 			// Ask the venue afresh: a drop publishes inventory the
 			// previous read couldn't have seen.
@@ -157,20 +208,36 @@ func sevenRoomsSnipeLoop(
 				logf("skipping unparseable slot %s: %v", next.Ref, err)
 				continue
 			}
+			var useCard *cardsecret.Card
 			if ref.RequiresPayment {
-				logf("skipping %s: %v", next.StartLabel(), sevenroomsapi.ErrPaymentRequired)
-				continue
+				switch {
+				case !approval.MayAutoBook(entry, ref):
+					passOver(next, "it needs a card and a person's approval")
+					continue
+				case card == nil:
+					passOver(next, sevenroomsapi.ErrPaymentRequired.Error())
+					continue
+				}
+				useCard = card
+				logf("attempt %s slot %s -> hold+book with card (auto_book_card)", date, next.StartLabel())
+			} else {
+				logf("attempt %s slot %s -> hold+book", date, next.StartLabel())
 			}
-			logf("attempt %s slot %s -> hold+book", date, next.StartLabel())
-			if _, err := sevenroomsapi.Reserve(client, ref, guest, nil); err != nil {
+			// Unattended, so nothing is authorized: a slot whose checkout
+			// turns out to charge is refused before any money moves.
+			if _, err := sevenroomsapi.ReserveWithCard(client, ref, guest, useCard, 0, nil); err != nil {
+				if errors.Is(err, sevenroomsapi.ErrChargeAtBooking) || errors.Is(err, sevenroomsapi.ErrGatewayUnsupported) {
+					passOver(next, err.Error())
+					continue
+				}
 				logf("book failed for %s %s: %v", date, next.StartLabel(), err)
 				continue
 			}
 			logf("BOOKED %s", next.StartLabel())
-			return next, nil
+			return next, nil, nil
 		}
 	}
-	return platform.Slot{}, fmt.Errorf("no bookable slot across %d dates", len(dateOrder))
+	return platform.Slot{}, needsApproval, fmt.Errorf("no bookable slot across %d dates", len(dateOrder))
 }
 
 // freshSlots reads a date's slots bypassing the venue client's cache,

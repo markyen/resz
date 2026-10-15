@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"resz/internal/bookflow"
+	"resz/internal/cardsecret"
 	"resz/internal/cliflag"
 	"resz/internal/notify"
 	"resz/internal/platform"
@@ -160,7 +161,10 @@ func Main(args []string) int {
 
 	// Reading the guest details now turns a misconfiguration into an
 	// error before the sleep rather than after it.
-	var guest sevenroomsapi.Guest
+	var (
+		guest sevenroomsapi.Guest
+		card  *cardsecret.Card
+	)
 	if scheduledOn[platform.SevenRooms] {
 		g, err := bookflow.SevenRoomsGuest()
 		if err != nil {
@@ -168,6 +172,11 @@ func Main(args []string) int {
 			return 1
 		}
 		guest = g
+		// Optional, as in check: without a card, card slots go to a
+		// person rather than failing the run.
+		if c, err := cardsecret.FromEnv(); err == nil {
+			card = c
+		}
 	}
 
 	// Per-venue warmup prep (parallel). Only Resy needs it: its snipe
@@ -247,7 +256,7 @@ func Main(args []string) int {
 				slot, ok = snipeVenue(ctx, client, auth, *emailFlag, os.Getenv("RESY_PASSWORD"),
 					p.s.entry, p.vc, p.currentConfigID, p.s.targetTime, partySize, blackout, logf)
 			case platform.SevenRooms:
-				slot, ok = snipeSevenRooms(ctx, client, guest, p.s.entry,
+				slot, ok = snipeSevenRooms(ctx, client, guest, card, p.s.entry,
 					p.s.targetTime, partySize, blackout, logf)
 			}
 			if !ok {
