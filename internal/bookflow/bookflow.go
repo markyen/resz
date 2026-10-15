@@ -106,6 +106,71 @@ func SlotsInWindow(vc platform.VenueClient, date string, partySize int, window *
 	return matched, nil
 }
 
+// Candidates walks a venue's in-window slots best-first: earliest of
+// `dates` first, and nearest PreferredTime first within a date — the
+// same order BestBookableSlot picks from. Dates are fetched lazily, so a
+// caller that books the first candidate costs no more than
+// BestBookableSlot does.
+//
+// It exists for callers that may have to pass over a slot, such as one
+// needing add-ons resz can't select (see resyapi.ErrAddOnsRequired), and
+// try the next-best instead. Exclude drops a slot's whole template from
+// the rest of the walk.
+type Candidates struct {
+	vc        platform.VenueClient
+	partySize int
+	dates     []string
+	window    *platform.Window
+	logger    func(string)
+
+	pending  []platform.Slot
+	excluded map[string]bool
+}
+
+// NewCandidates returns a Candidates walk over dates. Pass window=nil
+// for the default weekday/weekend window.
+func NewCandidates(vc platform.VenueClient, partySize int, dates []string, window *platform.Window, logger func(string)) *Candidates {
+	return &Candidates{vc: vc, partySize: partySize, dates: dates, window: window, logger: logger}
+}
+
+// Next returns the next candidate slot. ok=false with no error means the
+// walk is exhausted. Any API error propagates.
+func (c *Candidates) Next() (slot platform.Slot, ok bool, err error) {
+	for {
+		for len(c.pending) > 0 {
+			s := c.pending[0]
+			c.pending = c.pending[1:]
+			if !c.excluded[resyapi.TemplateID(s.Ref)] {
+				return s, true, nil
+			}
+		}
+		if len(c.dates) == 0 {
+			return platform.Slot{}, false, nil
+		}
+		d := c.dates[0]
+		c.dates = c.dates[1:]
+		slots, err := SlotsInWindow(c.vc, d, c.partySize, c.window, c.logger)
+		if err != nil {
+			return platform.Slot{}, false, err
+		}
+		platform.SortByPreference(slots, PreferredTime)
+		c.pending = slots
+	}
+}
+
+// Exclude skips every remaining slot that shares s's Resy template. It
+// is a no-op for slots on other platforms.
+func (c *Candidates) Exclude(s platform.Slot) {
+	t := resyapi.TemplateID(s.Ref)
+	if t == "" {
+		return
+	}
+	if c.excluded == nil {
+		c.excluded = map[string]bool{}
+	}
+	c.excluded[t] = true
+}
+
 // Book reserves a slot, dispatching on the platform it came from.
 //
 // The two platforms authenticate very differently. Resy books against a

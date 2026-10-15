@@ -2,6 +2,7 @@ package snipe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -182,6 +183,10 @@ func snipeLoop(
 		slotsByDate = map[string][]platform.Slot{}
 		triedMu     sync.Mutex
 		tried       = map[string]bool{}
+		// needsAddOns holds templates whose slots Resy refused for want
+		// of add-on selections; see resyapi.ErrAddOnsRequired. Guarded
+		// by triedMu.
+		needsAddOns = map[string]bool{}
 	)
 
 	getSlots := func(d string) ([]platform.Slot, error) {
@@ -220,7 +225,7 @@ func snipeLoop(
 			}
 			triedMu.Lock()
 			for _, s := range slots {
-				if !tried[s.Ref] {
+				if !tried[s.Ref] && !needsAddOns[resyapi.TemplateID(s.Ref)] {
 					triedMu.Unlock()
 					return d, s, true
 				}
@@ -230,17 +235,30 @@ func snipeLoop(
 		return "", platform.Slot{}, false
 	}
 
+	// fetchPrep gets a book_token for the next-best slot. A slot needing
+	// add-ons is never bookable, so rather than failing on it, fetchPrep
+	// passes over its whole template and carries on down the list.
 	fetchPrep := func() prep {
-		d, s, ok := pickNext()
-		if !ok {
-			return prep{err: fmt.Errorf("no untried slots across %d dates", len(dateOrder))}
+		for {
+			d, s, ok := pickNext()
+			if !ok {
+				return prep{err: fmt.Errorf("no untried slots across %d dates", len(dateOrder))}
+			}
+			bt, err := resyapi.Details(client, auth.Token, s.Ref, nil)
+			if errors.Is(err, resyapi.ErrAddOnsRequired) {
+				logf("skipping %q slots: they require add-ons resz can't select", s.Label)
+				triedMu.Lock()
+				needsAddOns[resyapi.TemplateID(s.Ref)] = true
+				tried[s.Ref] = true
+				triedMu.Unlock()
+				continue
+			}
+			if err != nil {
+				markTried(s.Ref)
+				return prep{slot: s, date: d, err: fmt.Errorf("details: %w", err)}
+			}
+			return prep{slot: s, date: d, bookToken: bt}
 		}
-		bt, err := resyapi.Details(client, auth.Token, s.Ref, nil)
-		if err != nil {
-			markTried(s.Ref)
-			return prep{slot: s, date: d, err: fmt.Errorf("details: %w", err)}
-		}
-		return prep{slot: s, date: d, bookToken: bt}
 	}
 
 	// Initial prep. If the cached token went stale since warmup, the first

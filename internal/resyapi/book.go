@@ -56,7 +56,11 @@ func Details(client *http.Client, authToken, configID string, logger func(string
 
 	if resp.StatusCode/100 != 2 {
 		body, _ := io.ReadAll(resp.Body)
-		return "", &APIError{Status: resp.StatusCode, Body: string(body)}
+		apiErr := &APIError{Status: resp.StatusCode, Body: string(body)}
+		if apiErr.needsAddOns() {
+			return "", fmt.Errorf("%w: %w", ErrAddOnsRequired, apiErr)
+		}
+		return "", apiErr
 	}
 
 	var dr detailsResponse
@@ -112,6 +116,41 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("http %d: %s", e.Status, e.Body)
+}
+
+// ErrAddOnsRequired marks a slot Resy won't book until the diner picks
+// from a required option group. resz sends no selections, so such a
+// slot can never be booked unattended.
+// The requirement belongs to the slot's template, so every slot sharing
+// it (see TemplateID) is equally unbookable.
+var ErrAddOnsRequired = errors.New("slot requires add-on selections resz cannot make")
+
+// needsAddOns reports whether /3/details refused the slot for missing
+// add-on selections. Resy answers 412 with code "invalid_item_selection"
+// ("Must select required add-ons.").
+func (e *APIError) needsAddOns() bool {
+	var body struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal([]byte(e.Body), &body) != nil {
+		return false
+	}
+	return body.Code == "invalid_item_selection"
+}
+
+// TemplateID returns the template segment of an rgs:// config id
+// (rgs://resy/<venue>/<template>/...), or "" if ref isn't one. Slots of
+// one type share a template, and with it any add-on requirement.
+func TemplateID(ref string) string {
+	rest, ok := strings.CutPrefix(ref, "rgs://")
+	if !ok {
+		return ""
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) < 3 {
+		return ""
+	}
+	return parts[2]
 }
 
 // IsAuthError returns true if the API error indicates the token is no

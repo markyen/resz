@@ -15,6 +15,7 @@ import (
 	"resz/internal/notify"
 	"resz/internal/platform"
 	"resz/internal/reslog"
+	"resz/internal/resyapi"
 	"resz/internal/sevenroomsapi"
 	"resz/internal/state"
 	"resz/internal/venueconfig"
@@ -83,6 +84,7 @@ func Main(args []string) int {
 		checkErr    error
 	)
 
+venues:
 	for i, v := range cfg.Venues {
 		if v.Check == nil {
 			continue
@@ -125,80 +127,99 @@ func Main(args []string) int {
 		if r := v.Check.TimeRange; r != nil {
 			window = &platform.Window{Earliest: r.Start, Latest: r.End}
 		}
-		_, slot, ok, ferr := bookflow.BestBookableSlot(vc, partySize, dates, window, nil)
-		if ferr != nil {
-			lg.Printf("[%s] availability error: %v", v.Name, ferr)
-			checkErr = ferr
-			break
-		}
-		if !ok {
-			lg.Printf("[%s] no slots in target window", v.Name)
-			continue
-		}
-		// A slot the venue will only hold against a card normally goes to
-		// a human first: the charge is real money and often
-		// non-refundable. The exception is a venue marked auto_book_card
-		// whose slot charges nothing at booking. Either way this is a
-		// skip rather than a failure, so the remaining venues still get
-		// their turn and health stays green.
-		if sevenroomsapi.IsRef(slot.Ref) {
-			if ref, perr := sevenroomsapi.ParseRef(slot.Ref); perr == nil && ref.RequiresPayment {
-				if !mayAutoBookCard(v, ref) {
-					if total := ref.ChargeTotal(); total > 0 && v.AutoBookCard {
-						// Worth saying out loud: the venue is marked for
-						// automatic booking but has started charging, so
-						// the interlock sent it to a human instead.
-						lg.Printf("[%s] auto_book_card is set but %s now charges $%.2f; asking anyway",
-							v.Name, slot.StartLabel(), total)
+		cands := bookflow.NewCandidates(vc, partySize, dates, window, nil)
+		skippedAddOns := 0
+		for {
+			slot, ok, ferr := cands.Next()
+			if ferr != nil {
+				lg.Printf("[%s] availability error: %v", v.Name, ferr)
+				checkErr = ferr
+				break venues
+			}
+			if !ok {
+				if skippedAddOns > 0 {
+					lg.Printf("[%s] no slots in target window without required add-ons", v.Name)
+				} else {
+					lg.Printf("[%s] no slots in target window", v.Name)
+				}
+				continue venues
+			}
+			// A slot the venue will only hold against a card normally goes to
+			// a human first: the charge is real money and often
+			// non-refundable. The exception is a venue marked auto_book_card
+			// whose slot charges nothing at booking. Either way this is a
+			// skip rather than a failure, so the remaining venues still get
+			// their turn and health stays green.
+			if sevenroomsapi.IsRef(slot.Ref) {
+				if ref, perr := sevenroomsapi.ParseRef(slot.Ref); perr == nil && ref.RequiresPayment {
+					if !mayAutoBookCard(v, ref) {
+						if total := ref.ChargeTotal(); total > 0 && v.AutoBookCard {
+							// Worth saying out loud: the venue is marked for
+							// automatic booking but has started charging, so
+							// the interlock sent it to a human instead.
+							lg.Printf("[%s] auto_book_card is set but %s now charges $%.2f; asking anyway",
+								v.Name, slot.StartLabel(), total)
+						}
+						lg.Printf("[%s] %s needs a card; requesting approval", v.Name, slot.StartLabel())
+						if *notifyFlag && s.ShouldNotifyApproval(slot.Ref, now) {
+							sendApprovalRequest(lg, v.Name, slot, ref)
+						}
+						continue venues
 					}
-					lg.Printf("[%s] %s needs a card; requesting approval", v.Name, slot.StartLabel())
-					if *notifyFlag && s.ShouldNotifyApproval(slot.Ref, now) {
-						sendApprovalRequest(lg, v.Name, slot, ref)
-					}
+					lg.Printf("[%s] %s needs a card but charges nothing at booking; auto-booking per auto_book_card",
+						v.Name, slot.StartLabel())
+				}
+			}
+
+			lg.Printf("[%s] bookable ref=%s; attempting booking", v.Name, slot.Ref)
+			_, berr := bookflow.Book(nil, slot,
+				os.Getenv("RESY_EMAIL"), os.Getenv("RESY_PASSWORD"), nil)
+			if berr != nil {
+				// A slot needing add-ons (a preorder, a takeout order) can't
+				// be booked by resz at all. That says nothing about the
+				// venue's other slot types, so pass over every slot of this
+				// one and try the next-best.
+				if errors.Is(berr, resyapi.ErrAddOnsRequired) {
+					lg.Printf("[%s] %s: %q slots require add-ons resz can't select; skipping them",
+						v.Name, slot.StartLabel(), slot.Label)
+					cands.Exclude(slot)
+					skippedAddOns++
 					continue
 				}
-				lg.Printf("[%s] %s needs a card but charges nothing at booking; auto-booking per auto_book_card",
-					v.Name, slot.StartLabel())
-			}
-		}
-
-		lg.Printf("[%s] bookable ref=%s; attempting booking", v.Name, slot.Ref)
-		_, berr := bookflow.Book(nil, slot,
-			os.Getenv("RESY_EMAIL"), os.Getenv("RESY_PASSWORD"), nil)
-		if berr != nil {
-			// Two cases are a human's to handle rather than a failed run:
-			// no card is configured, or the venue is on a gateway resz
-			// cannot drive. Both ask for approval and let the rest of the
-			// venues have their turn.
-			if errors.Is(berr, sevenroomsapi.ErrPaymentRequired) ||
-				errors.Is(berr, sevenroomsapi.ErrGatewayUnsupported) {
-				lg.Printf("[%s] %v; falling back to approval", v.Name, berr)
-				if ref, perr := sevenroomsapi.ParseRef(slot.Ref); perr == nil {
-					if *notifyFlag && s.ShouldNotifyApproval(slot.Ref, now) {
-						sendApprovalRequest(lg, v.Name, slot, ref)
+				// Two cases are a human's to handle rather than a failed run:
+				// no card is configured, or the venue is on a gateway resz
+				// cannot drive. Both ask for approval and let the rest of the
+				// venues have their turn.
+				if errors.Is(berr, sevenroomsapi.ErrPaymentRequired) ||
+					errors.Is(berr, sevenroomsapi.ErrGatewayUnsupported) {
+					lg.Printf("[%s] %v; falling back to approval", v.Name, berr)
+					if ref, perr := sevenroomsapi.ParseRef(slot.Ref); perr == nil {
+						if *notifyFlag && s.ShouldNotifyApproval(slot.Ref, now) {
+							sendApprovalRequest(lg, v.Name, slot, ref)
+						}
 					}
+					continue venues
 				}
-				continue
+				lg.Printf("[%s] booking error: %v", v.Name, berr)
+				checkErr = berr
+				break venues
 			}
-			lg.Printf("[%s] booking error: %v", v.Name, berr)
-			checkErr = berr
-			break
+			bookedVenue = v.Name
+			bookedWhen = slot.StartLabel()
+			// Block the booked date from future attempts.
+			if cfg.AddBlackout(slot.Date()) {
+				lg.Printf("[%s] added %s to blackout_dates", v.Name, slot.Date())
+			}
+			// Remove the booked venue from venues.json. Errors here are
+			// non-fatal — the booking is already confirmed at this point.
+			cfg.Venues = append(cfg.Venues[:i], cfg.Venues[i+1:]...)
+			if err := venueconfig.Save(cfgPath, cfg); err != nil {
+				lg.Printf("[%s] failed to save venues.json: %v", v.Name, err)
+			} else {
+				lg.Printf("[%s] removed from venues.json", v.Name)
+			}
+			break venues
 		}
-		bookedVenue = v.Name
-		bookedWhen = slot.StartLabel()
-		// Block the booked date from future attempts.
-		if cfg.AddBlackout(slot.Date()) {
-			lg.Printf("[%s] added %s to blackout_dates", v.Name, slot.Date())
-		}
-		// Remove the booked venue from venues.json. Errors here are
-		// non-fatal — the booking is already confirmed at this point.
-		cfg.Venues = append(cfg.Venues[:i], cfg.Venues[i+1:]...)
-		if err := venueconfig.Save(cfgPath, cfg); err != nil {
-			lg.Printf("[%s] failed to save venues.json: %v", v.Name, err)
-		} else {
-			lg.Printf("[%s] removed from venues.json", v.Name)
-		}
-		break
 	}
 
 	var prevHealth state.HealthState
