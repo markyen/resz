@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"resz/internal/approval"
 	"resz/internal/bookflow"
 	"resz/internal/cliflag"
 	"resz/internal/notify"
@@ -325,50 +326,14 @@ func trim(s string, n int) string {
 	return s[:n] + "...(truncated)"
 }
 
-// sendApprovalRequest asks the human to authorize a card booking. The
-// message carries the amount and the exact command that books it, so a
-// reply can be acted on without anyone having to reconstruct the
-// reference by hand.
+// sendApprovalRequest asks the human to authorize a card booking; see
+// approval.Message for what the request says.
 func sendApprovalRequest(lg interface{ Printf(string, ...any) }, venue string, slot platform.Slot, ref sevenroomsapi.Ref) {
-	msg, amount := approvalMessage(venue, slot, ref)
-	switch err := notify.Send(msg); {
-	case err == nil:
-		lg.Printf("[%s] approval requested (%s)", venue, amount)
-	case errors.Is(err, notify.ErrNoTransport):
-		lg.Printf("[%s] approval needed (%s) but no notify transport is configured", venue, amount)
-	default:
-		lg.Printf("[%s] approval notify failed: %v", venue, err)
-	}
-}
-
-// approvalMessage builds the request a human answers with APPROVE, and
-// returns the amount separately for the log line. The reference is
-// included verbatim so the booking that follows cannot drift to a
-// different slot, and the amount is stated so approval is given for a
-// specific number rather than "a deposit".
-func approvalMessage(venue string, slot platform.Slot, ref sevenroomsapi.Ref) (msg, amount string) {
-	if total := ref.ChargeTotal(); total > 0 {
-		amount = fmt.Sprintf("$%.2f", total)
-		if ref.ChargeType == "person" {
-			amount += fmt.Sprintf(" ($%.2f x %d)", ref.Cost, ref.PartySize)
-		}
-	} else {
-		amount = "a card on file (no amount advertised)"
-	}
-	msg = fmt.Sprintf("%s: %s on %s needs %s.\n\nReply APPROVE to book it in the widget, or ignore this message to let it go.\n\n%s\nref: %s",
-		venue, slot.StartLabel(), ref.Date(), amount, ref.WidgetURL(), slot.Ref)
-	return msg, amount
+	approval.Send(lg, nil, venue, slot, ref)
 }
 
 // mayAutoBookCard reports whether a card-required slot can be booked
-// without asking. Both halves matter: the venue has to be marked for it,
-// and the slot has to charge nothing at booking time. The second half is
-// an interlock, not a formality — it means a venue that switches from a
-// card-on-file hold to a real deposit starts asking again on its own,
-// with no config change.
-//
-// It says nothing about what the venue may bill later. These slots keep a
-// card on file precisely so they can charge a no-show fee.
+// without asking; see approval.MayAutoBook.
 func mayAutoBookCard(v venueconfig.ConfigEntry, ref sevenroomsapi.Ref) bool {
-	return v.AutoBookCard && ref.ChargeTotal() == 0
+	return approval.MayAutoBook(v, ref)
 }
