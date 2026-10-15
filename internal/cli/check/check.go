@@ -186,12 +186,14 @@ venues:
 					skippedAddOns++
 					continue
 				}
-				// Two cases are a human's to handle rather than a failed run:
-				// no card is configured, or the venue is on a gateway resz
-				// cannot drive. Both ask for approval and let the rest of the
-				// venues have their turn.
+				// Three cases are a human's to handle rather than a failed run:
+				// no card is configured, the venue is on a gateway resz
+				// cannot drive, or the venue's checkout quoted a charge the
+				// advertised price didn't show. All ask for approval and let
+				// the rest of the venues have their turn.
 				if errors.Is(berr, sevenroomsapi.ErrPaymentRequired) ||
-					errors.Is(berr, sevenroomsapi.ErrGatewayUnsupported) {
+					errors.Is(berr, sevenroomsapi.ErrGatewayUnsupported) ||
+					errors.Is(berr, sevenroomsapi.ErrChargeAtBooking) {
 					lg.Printf("[%s] %v; falling back to approval", v.Name, berr)
 					if ref, perr := sevenroomsapi.ParseRef(slot.Ref); perr == nil {
 						if *notifyFlag && s.ShouldNotifyApproval(slot.Ref, now) {

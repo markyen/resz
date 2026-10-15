@@ -86,7 +86,12 @@ type Reservation struct {
 	// confirmation email, e.g. "ABCD1234EFG". It is what a person reads
 	// out at the host stand, so it is worth surfacing over the opaque id.
 	Confirmation string
-	Raw          []byte
+	// Charge is what the booking cost, as quoted by the venue; zero for a
+	// slot that took no money. PaymentID is the Stripe PaymentIntent that
+	// paid or pre-authorized it, when there was one.
+	Charge    Charge
+	PaymentID string
+	Raw       []byte
 }
 
 // CreateHold claims the table behind ref for a few minutes.
@@ -195,16 +200,19 @@ func ReleaseHold(client *http.Client, ref Ref, hold *Hold, logger func(string)) 
 // multipart form. Marketing and SMS opt-ins are deliberately absent —
 // the widget omits them when they're declined, so omitting them opts out.
 func Book(client *http.Client, ref Ref, venue *Venue, guest Guest, hold *Hold, logger func(string)) (*Reservation, error) {
-	return BookWithCard(client, ref, venue, guest, hold, "", logger)
+	return BookWithCard(client, ref, venue, guest, hold, "", Charge{}, logger)
 }
 
-// BookWithCard is Book with a confirmed SetupIntent id attached, for a
-// venue that will only hold the table against a card. The id travels in
-// the form's card_token field — despite the name it is a "seti_..."
-// SetupIntent id, not a card or payment-method token.
+// BookWithCard is Book with a confirmed Stripe intent attached, for a
+// venue that will only hold the table against a card. The intent id
+// travels in the form's card_token field — despite the name it is a
+// "seti_..." SetupIntent or "pi_..." PaymentIntent id, not a card or
+// payment-method token.
 //
-// An empty cardToken books exactly as Book does.
-func BookWithCard(client *http.Client, ref Ref, venue *Venue, guest Guest, hold *Hold, cardToken string, logger func(string)) (*Reservation, error) {
+// A slot that charged at booking also reports the charge, broken down as
+// the widget reports it, so the venue can reconcile it with the payment.
+// An empty cardToken and a zero charge book exactly as Book does.
+func BookWithCard(client *http.Client, ref Ref, venue *Venue, guest Guest, hold *Hold, cardToken string, charge Charge, logger func(string)) (*Reservation, error) {
 	if err := guest.Validate(); err != nil {
 		return nil, err
 	}
@@ -247,6 +255,9 @@ func BookWithCard(client *http.Client, ref Ref, venue *Venue, guest Guest, hold 
 	if cardToken != "" {
 		fields["card_token"] = cardToken
 	}
+	for k, v := range chargeFields(charge) {
+		fields[k] = v
+	}
 
 	path := fmt.Sprintf(bookPathFmt, ref.Venue)
 	if logger != nil {
@@ -268,6 +279,26 @@ func BookWithCard(client *http.Client, ref Ref, venue *Venue, guest Guest, hold 
 		return nil, &apiError{Status: resp.StatusCode, Body: bookMessage(resp.StatusCode, raw)}
 	}
 	return &Reservation{ID: reservationID(raw), Confirmation: confirmationCode(raw), Raw: raw}, nil
+}
+
+// chargeFields renders a charge as the booking form's charge fields. The
+// widget leaves out every zero amount (it skips falsy values when it
+// builds the form), so a slot that charges nothing adds no fields at all.
+func chargeFields(c Charge) map[string]string {
+	out := map[string]string{}
+	for k, v := range map[string]float64{
+		"charge_base_amount":    c.Base,
+		"charge_service_charge": c.ServiceCharge,
+		"charge_tax":            c.Tax,
+		"charge_gratuity":       c.Gratuity,
+		"charge_amount":         c.DueNow,
+		"amount_due":            c.DueNow,
+	} {
+		if v > 0 {
+			out[k] = formatAmount(v)
+		}
+	}
+	return out
 }
 
 // IsRateLimited reports whether err is SevenRooms throttling us. The book

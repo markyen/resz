@@ -46,20 +46,21 @@ evaluated for the requested party size, plus `cost` / `charge_type`) and
 is recorded on the `sr://` reference as `cc=1`.
 
 `resz` books these when a card is configured: the card is read from the
-environment, exchanged for a Stripe SetupIntent, and only the intent id
+environment and confirmed straight to Stripe, and only the intent id
 reaches SevenRooms. With no card configured the slot is refused with
 `ErrPaymentRequired` before a table is held.
 
-Slots that take money up front are always refused, with
-`ErrChargeAtBooking`. `resz` stores a card against a table; it does not
-spend. See `sevenrooms-payment.md`.
+Slots that take money up front are refused with `ErrChargeAtBooking`
+unless a person has approved the amount (`resz book --authorize N`);
+`check` and `snipe` never authorize a charge and ask instead. See
+`sevenrooms-payment.md`.
 
 ## The flow
 
 `resz availability` prints an `sr://` reference carrying everything a
 booking needs — venue, time, party size, access rule, shift, duration.
-`resz book` then runs three calls — four when the slot needs a card, with
-the extra pair documented in `sevenrooms-payment.md`:
+`resz book` then runs these calls, with the extra steps a card slot
+needs documented in `sevenrooms-payment.md`:
 
 1. **Hold** — `POST /api-yoa/dining/hold/add`, JSON:
    `{venue, date, time, party_size, access_persistent_id,

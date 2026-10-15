@@ -45,18 +45,29 @@ type Ref struct {
 	ChargeType string
 }
 
-// ChargeTotal is what booking this slot will actually cost: Cost per
-// person for a per-person charge, otherwise Cost once. It reports 0 when
-// the slot carries no price, which includes card-on-file slots that
-// authorize nothing up front.
+// ChargeTotal is the slot's advertised price: Cost per person for a
+// per-person charge, otherwise Cost once, and for the "_slot" charge types
+// scaled by the slot's length in quarter hours, as the widget bills them.
+// It reports 0 when the slot carries no price, which includes card-on-file
+// slots that authorize nothing up front.
+//
+// It is a floor, not the bill: the venue adds any service charge, tax and
+// gratuity at checkout. SlotCharge asks for the full amount.
 func (r Ref) ChargeTotal() float64 {
 	if r.Cost <= 0 {
 		return 0
 	}
-	if r.ChargeType == "person" && r.PartySize > 0 {
-		return r.Cost * float64(r.PartySize)
+	total := r.Cost
+	switch r.ChargeType {
+	case "person", "person_slot":
+		if r.PartySize > 0 {
+			total *= float64(r.PartySize)
+		}
 	}
-	return r.Cost
+	if strings.HasSuffix(r.ChargeType, "_slot") && r.Duration > 0 {
+		total *= float64(r.Duration) / 15
+	}
+	return total
 }
 
 // String renders the ref as

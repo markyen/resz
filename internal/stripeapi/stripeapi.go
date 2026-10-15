@@ -166,6 +166,141 @@ type SetupIntentResult struct {
 // not fabricate one. If Stripe or the venue requires it, that booking has
 // to be completed by a person in the widget — see docs/sevenrooms-payment.md.
 func ConfirmSetupIntent(client *http.Client, card *cardsecret.Card, clientSecret, publishableKey, connectedAccount string, logger func(string)) (*SetupIntentResult, error) {
+	out, err := confirmIntent(client, "setup_intents", "seti_", card, clientSecret, publishableKey, connectedAccount, logger)
+	if err != nil {
+		return nil, err
+	}
+	if out.Status != "succeeded" {
+		return nil, fmt.Errorf("setup intent ended in status %q, not succeeded", out.Status)
+	}
+	if logger != nil {
+		logger("setup intent " + out.ID + " succeeded (" + out.PaymentMethod + ")")
+	}
+	return &SetupIntentResult{ID: out.ID, PaymentMethod: out.PaymentMethod, Status: out.Status}, nil
+}
+
+// PaymentIntentResult is the outcome of confirming a PaymentIntent.
+type PaymentIntentResult struct {
+	// ID is the "pi_..." identifier, which the booking carries in its
+	// card_token field the same way a SetupIntent id would.
+	ID     string
+	Status string
+	// AmountCents is what Stripe charged or held, in the currency's minor
+	// unit.
+	AmountCents int64
+	Currency    string
+}
+
+// PaymentIntentInfo is a PaymentIntent as read back before confirming.
+type PaymentIntentInfo struct {
+	ID          string
+	AmountCents int64
+	Currency    string
+	Status      string
+}
+
+// RetrievePaymentIntent reads a PaymentIntent with its client secret,
+// which is how a caller checks the amount the venue actually asked Stripe
+// for before handing over a card. It moves no money.
+func RetrievePaymentIntent(client *http.Client, clientSecret, publishableKey, connectedAccount string, logger func(string)) (*PaymentIntentInfo, error) {
+	if !strings.HasPrefix(publishableKey, "pk_") {
+		return nil, fmt.Errorf("stripe publishable key %q does not look like a pk_ key", truncateKey(publishableKey))
+	}
+	id, _, ok := strings.Cut(clientSecret, "_secret_")
+	if !ok || !strings.HasPrefix(id, "pi_") {
+		return nil, fmt.Errorf("client secret does not look like a PaymentIntent secret")
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 20 * time.Second}
+	}
+	q := url.Values{}
+	q.Set("client_secret", clientSecret)
+	q.Set("key", publishableKey)
+	if connectedAccount != "" {
+		q.Set("_stripe_account", connectedAccount)
+	}
+	path := "/v1/payment_intents/" + url.PathEscape(id)
+	req, err := http.NewRequest("GET", BaseURL+path+"?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+publishableKey)
+	if connectedAccount != "" {
+		req.Header.Set("Stripe-Account", connectedAccount)
+	}
+	if logger != nil {
+		logger("GET " + BaseURL + path)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		ID       string `json:"id"`
+		Amount   int64  `json:"amount"`
+		Currency string `json:"currency"`
+		Status   string `json:"status"`
+		Error    struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if jerr := json.Unmarshal(body, &out); jerr != nil {
+		return nil, fmt.Errorf("stripe returned %d with an unreadable body", resp.StatusCode)
+	}
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("stripe would not read payment intent %s: %s", id, out.Error.Message)
+	}
+	return &PaymentIntentInfo{ID: out.ID, AmountCents: out.Amount, Currency: out.Currency, Status: out.Status}, nil
+}
+
+// ConfirmPaymentIntent pays an existing PaymentIntent with card. This is
+// the step that moves money: a charge is captured, a pre-authorization is
+// held.
+//
+// clientSecret comes from the venue's payment-intent endpoint, and the
+// keys from its venue_info, exactly as for ConfirmSetupIntent. Callers
+// should check the amount with RetrievePaymentIntent first.
+func ConfirmPaymentIntent(client *http.Client, card *cardsecret.Card, clientSecret, publishableKey, connectedAccount string, logger func(string)) (*PaymentIntentResult, error) {
+	out, err := confirmIntent(client, "payment_intents", "pi_", card, clientSecret, publishableKey, connectedAccount, logger)
+	if err != nil {
+		return nil, err
+	}
+	// "requires_capture" is a successful pre-authorization, or a charge
+	// on a venue that captures later; either way the card is good for it.
+	if out.Status != "succeeded" && out.Status != "requires_capture" {
+		return nil, fmt.Errorf("payment intent ended in status %q, not succeeded", out.Status)
+	}
+	if logger != nil {
+		logger(fmt.Sprintf("payment intent %s %s (%d %s)", out.ID, out.Status, out.Amount, out.Currency))
+	}
+	return &PaymentIntentResult{ID: out.ID, Status: out.Status, AmountCents: out.Amount, Currency: out.Currency}, nil
+}
+
+// intentResponse is the part of a confirmed Setup- or PaymentIntent that
+// resz reads.
+type intentResponse struct {
+	ID            string `json:"id"`
+	Status        string `json:"status"`
+	PaymentMethod string `json:"payment_method"`
+	Amount        int64  `json:"amount"`
+	Currency      string `json:"currency"`
+	NextAction    any    `json:"next_action"`
+	Error         struct {
+		Message string `json:"message"`
+		Code    string `json:"code"`
+	} `json:"error"`
+}
+
+// confirmIntent confirms a Setup- or PaymentIntent with card. kind is the
+// API collection ("setup_intents") and idPrefix the id prefix its client
+// secrets carry ("seti_"). The request is the same for both: only the
+// path differs.
+func confirmIntent(client *http.Client, kind, idPrefix string, card *cardsecret.Card, clientSecret, publishableKey, connectedAccount string, logger func(string)) (*intentResponse, error) {
 	if card == nil {
 		return nil, cardsecret.ErrNoCard
 	}
@@ -173,8 +308,8 @@ func ConfirmSetupIntent(client *http.Client, card *cardsecret.Card, clientSecret
 		return nil, fmt.Errorf("stripe publishable key %q does not look like a pk_ key", truncateKey(publishableKey))
 	}
 	id, _, ok := strings.Cut(clientSecret, "_secret_")
-	if !ok || !strings.HasPrefix(id, "seti_") {
-		return nil, fmt.Errorf("client secret does not look like a SetupIntent secret")
+	if !ok || !strings.HasPrefix(id, idPrefix) {
+		return nil, fmt.Errorf("client secret does not look like a %s secret", kind)
 	}
 	if client == nil {
 		client = &http.Client{Timeout: 20 * time.Second}
@@ -198,7 +333,7 @@ func ConfirmSetupIntent(client *http.Client, card *cardsecret.Card, clientSecret
 		form.Set("_stripe_account", connectedAccount)
 	}
 
-	path := "/v1/setup_intents/" + url.PathEscape(id) + "/confirm"
+	path := "/v1/" + kind + "/" + url.PathEscape(id) + "/confirm"
 	req, err := http.NewRequest("POST", BaseURL+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
@@ -210,7 +345,7 @@ func ConfirmSetupIntent(client *http.Client, card *cardsecret.Card, clientSecret
 	}
 	// The body is the card; it is never logged.
 	if logger != nil {
-		logger("POST " + BaseURL + path + " (confirm setup intent with " + card.Redacted() + ")")
+		logger("POST " + BaseURL + path + " (confirm with " + card.Redacted() + ")")
 	}
 
 	resp, err := client.Do(req)
@@ -222,16 +357,7 @@ func ConfirmSetupIntent(client *http.Client, card *cardsecret.Card, clientSecret
 	if err != nil {
 		return nil, err
 	}
-	var out struct {
-		ID            string `json:"id"`
-		Status        string `json:"status"`
-		PaymentMethod string `json:"payment_method"`
-		NextAction    any    `json:"next_action"`
-		Error         struct {
-			Message string `json:"message"`
-			Code    string `json:"code"`
-		} `json:"error"`
-	}
+	var out intentResponse
 	if jerr := json.Unmarshal(body, &out); jerr != nil {
 		return nil, fmt.Errorf("stripe returned %d with an unreadable body", resp.StatusCode)
 	}
@@ -247,11 +373,5 @@ func ConfirmSetupIntent(client *http.Client, card *cardsecret.Card, clientSecret
 		// rather than leaving a half-set-up intent behind.
 		return nil, fmt.Errorf("this card needs extra verification (3-D Secure); complete the booking in the venue's widget")
 	}
-	if out.Status != "succeeded" {
-		return nil, fmt.Errorf("setup intent ended in status %q, not succeeded", out.Status)
-	}
-	if logger != nil {
-		logger("setup intent " + out.ID + " succeeded (" + out.PaymentMethod + ")")
-	}
-	return &SetupIntentResult{ID: out.ID, PaymentMethod: out.PaymentMethod, Status: out.Status}, nil
+	return &out, nil
 }

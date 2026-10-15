@@ -56,7 +56,7 @@ func TestSetUpCardNeedsAGateway(t *testing.T) {
 	card := testCard(t)
 	// Only Stripe can be driven headlessly. A FreedomPay venue must say so
 	// in terms that stop a caller retrying, and send it to the widget.
-	_, err := setUpCard(nil, &Venue{Slug: "othervenue", ID: "abc", PaymentSystem: "FREEDOMPAY"}, card, 0, nil)
+	_, _, err := setUpCard(nil, &Venue{Slug: "othervenue", ID: "abc", PaymentSystem: "FREEDOMPAY"}, card, Charge{}, nil)
 	if !errors.Is(err, ErrGatewayUnsupported) {
 		t.Fatalf("err = %v, want ErrGatewayUnsupported", err)
 	}
@@ -70,7 +70,7 @@ func TestSetUpCardNeedsAGateway(t *testing.T) {
 // A venue that reports no gateway at all still produces a readable error
 // rather than naming an empty string.
 func TestSetUpCardWithUnnamedGateway(t *testing.T) {
-	_, err := setUpCard(nil, &Venue{Slug: "somewhere", ID: "abc"}, testCard(t), 0, nil)
+	_, _, err := setUpCard(nil, &Venue{Slug: "somewhere", ID: "abc"}, testCard(t), Charge{}, nil)
 	if !errors.Is(err, ErrGatewayUnsupported) {
 		t.Fatalf("err = %v, want ErrGatewayUnsupported", err)
 	}
@@ -80,7 +80,7 @@ func TestSetUpCardWithUnnamedGateway(t *testing.T) {
 }
 
 func TestSetUpCardNeedsVenueID(t *testing.T) {
-	_, err := setUpCard(nil, nil, testCard(t), 0, nil)
+	_, _, err := setUpCard(nil, nil, testCard(t), Charge{}, nil)
 	if err == nil || !strings.Contains(err.Error(), "internal id") {
 		t.Fatalf("err = %v, want a complaint about the missing venue id", err)
 	}

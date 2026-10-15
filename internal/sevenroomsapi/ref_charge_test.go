@@ -14,6 +14,9 @@ func TestChargeTotal(t *testing.T) {
 		{"no cost", Ref{ChargeType: "person", PartySize: 4}, 0},
 		{"card on file, no amount", Ref{RequiresPayment: true, PartySize: 2}, 0},
 		{"party size unset", Ref{Cost: 50, ChargeType: "person"}, 50},
+		// The "_slot" types bill per quarter hour of the slot as well.
+		{"per person per quarter hour", Ref{Cost: 5, ChargeType: "person_slot", PartySize: 2, Duration: 90}, 60},
+		{"per reservation per quarter hour", Ref{Cost: 10, ChargeType: "reservation_slot", PartySize: 2, Duration: 120}, 80},
 	}
 	for _, tt := range tests {
 		if got := tt.ref.ChargeTotal(); got != tt.want {
