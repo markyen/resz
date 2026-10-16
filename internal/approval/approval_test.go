@@ -164,3 +164,25 @@ func TestMayAutoBook(t *testing.T) {
 		t.Error("a venue not opted in must ask")
 	}
 }
+
+// A Resy deposit: the amount, what APPROVE does, the figure to authorize,
+// and the reference verbatim on the last line.
+func TestResyMessageQuotesTheDeposit(t *testing.T) {
+	start := time.Date(2026, 11, 14, 19, 0, 0, 0, time.UTC)
+	slot := platform.Slot{Platform: platform.Resy, Start: start,
+		Ref: "rgs://resy/90001/123/2/2026-11-14/2026-11-14/19:00:00/2/Table"}
+	msg, cost := ResyMessage("Paid Venue", slot, 2, 200)
+	if cost != "charges $200.00 at booking (a deposit or prepayment, through Resy)" {
+		t.Errorf("cost = %q", cost)
+	}
+	for _, want := range []string{"Paid Venue", "Nov 14", "party of 2",
+		"Reply APPROVE and resz will book it with the card on your Resy account, charging $200.00.",
+		"authorize: 200.00\n"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message is missing %q:\n%s", want, msg)
+		}
+	}
+	if !strings.HasSuffix(msg, "\nref: "+slot.Ref) {
+		t.Errorf("the ref must be the last line, verbatim:\n%s", msg)
+	}
+}

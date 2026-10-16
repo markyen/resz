@@ -105,28 +105,38 @@ func snipeSevenRooms(
 }
 
 // requestApproval asks a person to approve a card slot, unless it was
-// asked about recently. The cooldown is the one check keeps, in the same
-// state file, so the two never ask twice about one slot.
+// asked about recently; see firstAsk.
 func requestApproval(client *http.Client, venue string, slot platform.Slot, logf func(string, ...any)) {
 	ref, err := sevenroomsapi.ParseRef(slot.Ref)
 	if err != nil {
 		logf("approval for %s: %v", slot.Ref, err)
 		return
 	}
-	// A state file that can't be read is no reason to stay quiet: a
-	// duplicate request is cheaper than a missed slot.
-	if st, err := state.Load(); err != nil {
-		logf("state load: %v (asking anyway)", err)
-	} else {
-		if !st.ShouldNotifyApproval(slot.Ref, time.Now()) {
-			logf("%s needs approval; already asked within %s", slot.StartLabel(), state.ApprovalCooldown)
-			return
-		}
-		if err := state.Save(st); err != nil {
-			logf("state save: %v", err)
-		}
+	if !firstAsk(slot, logf) {
+		return
 	}
 	approval.Send(logger, client, venue, slot, ref)
+}
+
+// firstAsk reports whether slot is due an approval request, and records
+// the ask. The cooldown is the one check keeps, in the same state file,
+// so the two never ask twice about one slot.
+func firstAsk(slot platform.Slot, logf func(string, ...any)) bool {
+	// A state file that can't be read is no reason to stay quiet: a
+	// duplicate request is cheaper than a missed slot.
+	st, err := state.Load()
+	if err != nil {
+		logf("state load: %v (asking anyway)", err)
+		return true
+	}
+	if !st.ShouldNotifyApproval(slot.Ref, time.Now()) {
+		logf("%s needs approval; already asked within %s", slot.StartLabel(), state.ApprovalCooldown)
+		return false
+	}
+	if err := state.Save(st); err != nil {
+		logf("state save: %v", err)
+	}
+	return true
 }
 
 // sevenRoomsSnipeLoop tries the target date first, then any other

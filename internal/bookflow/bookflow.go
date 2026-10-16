@@ -256,18 +256,31 @@ func SevenRoomsGuest() (sevenroomsapi.Guest, error) {
 }
 
 // AuthAndBook performs the Resy auth → details → book sequence used by
-// both `resz book` and `resz check` after a slot has been identified. If
-// the cached token is rejected at /3/details with a 401/419, the cache is
-// cleared and one refresh + retry is attempted before giving up.
+// `resz check` after a slot has been identified, authorizing no charge:
+// a slot that takes a deposit or prepayment is refused with
+// resyapi.ErrChargeAtBooking before anything is booked.
 //
 // Returns the raw response body from /3/book on success, or the body
 // (which may be nil) plus a wrapped error on failure.
 func AuthAndBook(client *http.Client, configID, email, password string, logger func(string)) ([]byte, error) {
+	body, _, err := AuthAndBookAuthorized(client, configID, email, password, 0, logger)
+	return body, err
+}
+
+// AuthAndBookAuthorized is AuthAndBook with a ceiling on what the booking
+// may charge at booking, in dollars. Zero authorizes nothing, which is
+// what scheduled callers pass; a non-zero value comes from a person who
+// has seen the amount and approved it. If the cached token is rejected at
+// /3/details with a 401/419, the cache is cleared and one refresh + retry
+// is attempted before giving up.
+//
+// It also returns the slot's details, which say what was charged.
+func AuthAndBookAuthorized(client *http.Client, configID, email, password string, authorizedUSD float64, logger func(string)) ([]byte, *resyapi.Detail, error) {
 	auth, err := resyapi.EnsureAuth(email, password, logger)
 	if err != nil {
-		return nil, fmt.Errorf("auth: %w", err)
+		return nil, nil, fmt.Errorf("auth: %w", err)
 	}
-	bookToken, err := resyapi.Details(client, auth.Token, configID, logger)
+	detail, err := resyapi.Details(client, auth.Token, configID, logger)
 	if err != nil {
 		if resyapi.IsAuthError(err) {
 			if logger != nil {
@@ -276,19 +289,27 @@ func AuthAndBook(client *http.Client, configID, email, password string, logger f
 			_ = resyapi.ClearAuth()
 			auth, err = resyapi.EnsureAuth(email, password, logger)
 			if err != nil {
-				return nil, fmt.Errorf("auth refresh: %w", err)
+				return nil, nil, fmt.Errorf("auth refresh: %w", err)
 			}
-			bookToken, err = resyapi.Details(client, auth.Token, configID, logger)
+			detail, err = resyapi.Details(client, auth.Token, configID, logger)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("details: %w", err)
+			return nil, nil, fmt.Errorf("details: %w", err)
 		}
 	}
-	body, err := resyapi.Book(client, auth.Token, bookToken, auth.PaymentMethodID, logger)
-	if err != nil {
-		return body, fmt.Errorf("book: %w", err)
+	if logger != nil && (detail.Charge > 0 || detail.CancellationFee > 0) {
+		logger(fmt.Sprintf("details: charge at booking $%.2f, cancellation fee $%.2f", detail.Charge, detail.CancellationFee))
 	}
-	return body, nil
+	// /3/book charges the card on the Resy account without asking, so
+	// this is the last point a deposit can be refused.
+	if err := detail.Authorize(authorizedUSD); err != nil {
+		return nil, detail, err
+	}
+	body, err := resyapi.Book(client, auth.Token, detail.BookToken, auth.PaymentMethodID, logger)
+	if err != nil {
+		return body, detail, fmt.Errorf("book: %w", err)
+	}
+	return body, detail, nil
 }
 
 // Search runs a venue search across the given platforms and merges the

@@ -84,8 +84,9 @@ func watches(v venueconfig.ConfigEntry, b booked) bool {
 }
 
 // summary is a one-line account of a successful booking, for the log and
-// the terminal: what, when, and every reference worth keeping.
-func summary(ref string, b booked, res *sevenroomsapi.Reservation, resyBody []byte) string {
+// the terminal: what, when, and every reference worth keeping. resyCharge
+// is what a Resy booking took at booking, from its details.
+func summary(ref string, b booked, res *sevenroomsapi.Reservation, resyBody []byte, resyCharge float64) string {
 	var parts []string
 	if res != nil {
 		if res.Confirmation != "" {
@@ -113,6 +114,9 @@ func summary(ref string, b booked, res *sevenroomsapi.Reservation, resyBody []by
 			if r.ResyToken != "" {
 				parts = append(parts, "resy_token "+r.ResyToken)
 			}
+		}
+		if resyCharge > 0 {
+			parts = append(parts, fmt.Sprintf("charged $%.2f at booking through Resy", resyCharge))
 		}
 	}
 	s := fmt.Sprintf("booked %s %s on %s", b.platform, b.venue, b.date)

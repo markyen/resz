@@ -187,6 +187,17 @@ venues:
 					skippedAddOns++
 					continue
 				}
+				// A Resy slot that takes a deposit or prepayment: check
+				// authorizes nothing, so the charge goes to a person,
+				// quoted, and the other venues still get their turn.
+				var ce *resyapi.ChargeError
+				if errors.As(berr, &ce) {
+					lg.Printf("[%s] %v; requesting approval", v.Name, berr)
+					if *notifyFlag && s.ShouldNotifyApproval(slot.Ref, now) {
+						approval.SendResy(lg, v.Name, slot, partySize, ce.Charge)
+					}
+					continue venues
+				}
 				// Three cases are a human's to handle rather than a failed run:
 				// no card is configured, the venue is on a gateway resz
 				// cannot drive, or the venue's checkout quoted a charge the

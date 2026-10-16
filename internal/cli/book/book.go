@@ -12,6 +12,7 @@ import (
 	"resz/internal/bookflow"
 	"resz/internal/cliflag"
 	"resz/internal/reslog"
+	"resz/internal/resyapi"
 	"resz/internal/sevenroomsapi"
 	"resz/internal/venueconfig"
 )
@@ -43,10 +44,11 @@ func Main(args []string) int {
 		fmt.Fprintln(os.Stderr, "  sr://  (SevenRooms) guest checkout; the diner's details are read")
 		fmt.Fprintln(os.Stderr, "                      from config/account.json.")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "A slot that charges money at booking is refused unless --authorize")
-		fmt.Fprintln(os.Stderr, "names an amount at least as large as the charge, including the tax and")
-		fmt.Fprintln(os.Stderr, "fees the venue adds. Pass the figure you were quoted: if the price has")
-		fmt.Fprintln(os.Stderr, "moved since, the booking is refused rather than silently costing more.")
+		fmt.Fprintln(os.Stderr, "A slot that charges money at booking (a deposit or prepayment, on either")
+		fmt.Fprintln(os.Stderr, "platform) is refused unless --authorize names an amount at least as")
+		fmt.Fprintln(os.Stderr, "large as the charge, including the tax and fees the venue adds. Pass the")
+		fmt.Fprintln(os.Stderr, "figure you were quoted: if the price has moved since, the booking is")
+		fmt.Fprintln(os.Stderr, "refused rather than silently costing more.")
 		cliflag.PrintDefaults(fs)
 	}
 	if err := fs.Parse(cliflag.Expand(fs, args)); err != nil {
@@ -93,9 +95,10 @@ func Main(args []string) int {
 	}
 
 	var (
-		body []byte
-		res  *sevenroomsapi.Reservation
-		err  error
+		body   []byte
+		res    *sevenroomsapi.Reservation
+		detail *resyapi.Detail
+		err    error
 	)
 	if sevenroomsapi.IsRef(ref) {
 		res, err = bookflow.BookSevenRoomsAuthorized(nil, ref, *authorizeFlag, steps)
@@ -103,7 +106,7 @@ func Main(args []string) int {
 			body = res.Raw
 		}
 	} else {
-		body, err = bookflow.AuthAndBook(nil, ref, *emailFlag, os.Getenv("RESY_PASSWORD"), steps)
+		body, detail, err = bookflow.AuthAndBookAuthorized(nil, ref, *emailFlag, os.Getenv("RESY_PASSWORD"), *authorizeFlag, steps)
 	}
 	if err != nil {
 		logf("FAILED %s: %v", ref, err)
@@ -121,11 +124,17 @@ func Main(args []string) int {
 		logf("BOOKED %s; could not read venue and date from the reference: %v", ref, perr)
 		return 0
 	}
-	var resyBody []byte
+	var (
+		resyBody   []byte
+		resyCharge float64
+	)
 	if res == nil {
 		resyBody = body
+		if detail != nil {
+			resyCharge = detail.Charge
+		}
 	}
-	line := summary(ref, b, res, resyBody)
+	line := summary(ref, b, res, resyBody, resyCharge)
 	logf("%s", line)
 	fmt.Fprintln(os.Stderr, line)
 	updateConfig(*configFlag, b, logf)

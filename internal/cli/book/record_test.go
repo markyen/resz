@@ -105,7 +105,7 @@ func TestSummaryKeepsEveryReference(t *testing.T) {
 		ID: "resid12345", Confirmation: "ABCD1234EFG", PaymentID: "pi_123",
 		Charge: sevenroomsapi.Charge{Base: 120, Tax: 10.65, DueNow: 130.65},
 	}
-	got := summary(ref, b, res, nil)
+	got := summary(ref, b, res, nil, 0)
 	for _, want := range []string{"venueb", "2026-10-31", "confirmation ABCD1234EFG", "reservation id resid12345",
 		"charged $130.65 ($120.00 + $10.65 tax) (Stripe pi_123)", ref} {
 		if !strings.Contains(got, want) {
@@ -115,8 +115,8 @@ func TestSummaryKeepsEveryReference(t *testing.T) {
 
 	resy := summary("rgs://resy/10002/1/2/2026-10-25/2026-10-25/19:00:00/2/Table",
 		booked{platform.Resy, "10002", "2026-10-25"}, nil,
-		[]byte(`{"resy_token":"rt_abc","reservation_id":123456789}`))
-	for _, want := range []string{"reservation id 123456789", "resy_token rt_abc"} {
+		[]byte(`{"resy_token":"rt_abc","reservation_id":123456789}`), 200)
+	for _, want := range []string{"reservation id 123456789", "resy_token rt_abc", "charged $200.00 at booking through Resy"} {
 		if !strings.Contains(resy, want) {
 			t.Errorf("Resy summary is missing %q: %s", want, resy)
 		}

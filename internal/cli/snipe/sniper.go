@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"resz/internal/approval"
 	"resz/internal/bookflow"
 	"resz/internal/platform"
 	"resz/internal/resyapi"
@@ -117,18 +118,43 @@ func snipeVenue(
 	deadline := targetTime.Add(10 * time.Second)
 	tctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	slot, bookErr := snipeLoop(tctx, client, auth, email, password, entry, vc, targetDate, targetTime.Location(), partySize, blackout, logf)
+	slot, charging, bookErr := snipeLoop(tctx, client, auth, email, password, entry, vc, targetDate, targetTime.Location(), partySize, blackout, logf)
 	if bookErr != nil {
 		logf("done without booking: %v", bookErr)
+		// A slot that takes a deposit is a person's call, and at a drop it
+		// goes in minutes, so ask now rather than leaving it to check.
+		if charging != nil {
+			requestDepositApproval(entry.Name, charging.slot, partySize, charging.charge, logf)
+		}
 		return platform.Slot{}, false
 	}
 	return slot, true
+}
+
+// chargedSlot is a slot snipe passed over because booking it would take a
+// deposit or prepayment, with the amount Resy quoted.
+type chargedSlot struct {
+	slot   platform.Slot
+	charge float64
+}
+
+// requestDepositApproval asks a person to approve a Resy slot that charges
+// at booking, unless it was asked about recently.
+func requestDepositApproval(venue string, slot platform.Slot, partySize int, charge float64, logf func(string, ...any)) {
+	if !firstAsk(slot, logf) {
+		return
+	}
+	approval.SendResy(logger, venue, slot, partySize, charge)
 }
 
 // snipeLoop tries booking the best slot on targetDate first, then on each
 // available fallback date (tomorrow → latest, ascending), retrying until
 // success or the context deadline expires. While each Book is in flight,
 // the next slot's book_token is fetched concurrently.
+//
+// A slot whose details show a charge at booking is passed over, like one
+// needing add-ons: an unattended booking authorizes nothing. The best such
+// slot comes back as charging, for an approval request.
 //
 // Returns the booked slot on success (err == nil), or the zero slot with
 // an error otherwise.
@@ -144,7 +170,7 @@ func snipeLoop(
 	partySize int,
 	blackout map[string]bool,
 	logf func(string, ...any),
-) (platform.Slot, error) {
+) (platform.Slot, *chargedSlot, error) {
 	type prep struct {
 		slot      platform.Slot
 		date      string
@@ -187,6 +213,10 @@ func snipeLoop(
 		// of add-on selections; see resyapi.ErrAddOnsRequired. Guarded
 		// by triedMu.
 		needsAddOns = map[string]bool{}
+		// charging holds templates whose slots take a deposit or
+		// prepayment, and first the best such slot. Guarded by triedMu.
+		charging = map[string]bool{}
+		first    *chargedSlot
 	)
 
 	getSlots := func(d string) ([]platform.Slot, error) {
@@ -225,7 +255,7 @@ func snipeLoop(
 			}
 			triedMu.Lock()
 			for _, s := range slots {
-				if !tried[s.Ref] && !needsAddOns[resyapi.TemplateID(s.Ref)] {
+				if t := resyapi.TemplateID(s.Ref); !tried[s.Ref] && !needsAddOns[t] && !charging[t] {
 					triedMu.Unlock()
 					return d, s, true
 				}
@@ -244,7 +274,7 @@ func snipeLoop(
 			if !ok {
 				return prep{err: fmt.Errorf("no untried slots across %d dates", len(dateOrder))}
 			}
-			bt, err := resyapi.Details(client, auth.Token, s.Ref, nil)
+			detail, err := resyapi.Details(client, auth.Token, s.Ref, nil)
 			if errors.Is(err, resyapi.ErrAddOnsRequired) {
 				logf("skipping %q slots: they require add-ons resz can't select", s.Label)
 				triedMu.Lock()
@@ -257,8 +287,26 @@ func snipeLoop(
 				markTried(s.Ref)
 				return prep{slot: s, date: d, err: fmt.Errorf("details: %w", err)}
 			}
-			return prep{slot: s, date: d, bookToken: bt}
+			if cerr := detail.Authorize(0); cerr != nil {
+				logf("passing over %q slots: %v", s.Label, cerr)
+				triedMu.Lock()
+				charging[resyapi.TemplateID(s.Ref)] = true
+				tried[s.Ref] = true
+				if first == nil {
+					first = &chargedSlot{slot: s, charge: detail.Charge}
+				}
+				triedMu.Unlock()
+				continue
+			}
+			return prep{slot: s, date: d, bookToken: detail.BookToken}
 		}
+	}
+
+	// pending reports the best slot passed over for its charge, if any.
+	pending := func() *chargedSlot {
+		triedMu.Lock()
+		defer triedMu.Unlock()
+		return first
 	}
 
 	// Initial prep. If the cached token went stale since warmup, the first
@@ -278,12 +326,12 @@ func snipeLoop(
 		}
 	}
 	if cur.err != nil {
-		return platform.Slot{}, cur.err
+		return platform.Slot{}, pending(), cur.err
 	}
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return platform.Slot{}, err
+			return platform.Slot{}, pending(), err
 		}
 		logf("attempt %s slot %s -> Book", cur.date, cur.slot.StartLabel())
 
@@ -304,12 +352,12 @@ func snipeLoop(
 		select {
 		case bookErr = <-bookCh:
 		case <-ctx.Done():
-			return platform.Slot{}, ctx.Err()
+			return platform.Slot{}, pending(), ctx.Err()
 		}
 
 		if bookErr == nil {
 			logf("BOOKED %s at %s", entry.Name, cur.slot.StartLabel())
-			return cur.slot, nil
+			return cur.slot, nil, nil
 		}
 		logf("book failed for %s %s: %v", cur.date, cur.slot.StartLabel(), bookErr)
 
@@ -318,11 +366,11 @@ func snipeLoop(
 		select {
 		case next = <-nextCh:
 		case <-ctx.Done():
-			return platform.Slot{}, ctx.Err()
+			return platform.Slot{}, pending(), ctx.Err()
 		}
 		if next.err != nil {
 			logf("prefetch failed: %v", next.err)
-			return platform.Slot{}, next.err
+			return platform.Slot{}, pending(), next.err
 		}
 		cur = next
 	}

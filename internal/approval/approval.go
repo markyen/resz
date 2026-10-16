@@ -1,6 +1,7 @@
-// Package approval asks a person to approve a SevenRooms booking that
-// resz will not make on its own: one that needs a card, at a venue not
-// marked for automatic card booking, or one that charges money.
+// Package approval asks a person to approve a booking that resz will not
+// make on its own: a SevenRooms slot that needs a card, at a venue not
+// marked for automatic card booking, or any slot — SevenRooms or Resy —
+// that charges money at booking.
 //
 // The request is a message carrying the slot reference verbatim, what
 // booking it will cost, and what a reply of APPROVE will do. Whatever acts
@@ -131,6 +132,31 @@ type Logger interface{ Printf(string, ...any) }
 // notify transport. Cooldown is the caller's business: this always sends.
 func Send(lg Logger, client *http.Client, venue string, slot platform.Slot, ref sevenroomsapi.Ref) {
 	msg, cost := Message(venue, slot, ref, Assess(client, ref, nil))
+	deliver(lg, venue, msg, cost)
+}
+
+// ResyMessage is Message for a Resy slot that charges at booking (a
+// deposit or a prepayment), with the amount from its details. Resy books
+// against the Resy account and the card saved there, so there is no card
+// or payment system to check: the only question is the charge.
+func ResyMessage(venue string, slot platform.Slot, partySize int, charge float64) (msg, cost string) {
+	cost = fmt.Sprintf("charges $%.2f at booking (a deposit or prepayment, through Resy)", charge)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s: %s, party of %d, %s.\n\n", venue, slot.StartLabel(), partySize, cost)
+	fmt.Fprintf(&b, "Reply APPROVE and resz will book it with the card on your Resy account, charging $%.2f.", charge)
+	b.WriteString(" Or ignore this message to let it go.\n\n")
+	fmt.Fprintf(&b, "authorize: %.2f\n", charge)
+	b.WriteString("ref: " + slot.Ref)
+	return b.String(), cost
+}
+
+// SendResy sends ResyMessage. Cooldown is the caller's business.
+func SendResy(lg Logger, venue string, slot platform.Slot, partySize int, charge float64) {
+	msg, cost := ResyMessage(venue, slot, partySize, charge)
+	deliver(lg, venue, msg, cost)
+}
+
+func deliver(lg Logger, venue, msg, cost string) {
 	switch err := notify.Send(msg); {
 	case err == nil:
 		lg.Printf("[%s] approval requested (%s)", venue, cost)
