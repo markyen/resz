@@ -276,8 +276,12 @@ func Main(args []string) int {
 		bookedIDs := make(map[string]bool, len(booked))
 		for _, b := range booked {
 			bookedIDs[b.venueID] = true
-			if cfg.AddBlackout(b.slot.Date()) {
-				logf("[%s] added %s to blackout_dates", b.name, b.slot.Date())
+			added, err := cfg.AddBookingBlackout(b.slot.Date())
+			if err != nil {
+				logf("[%s] blackout window: %v", b.name, err)
+			}
+			if len(added) > 0 {
+				logf("[%s] added %s to blackout_dates", b.name, venueconfig.DateSpan(added))
 			}
 		}
 		out := cfg.Venues[:0]

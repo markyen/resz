@@ -220,9 +220,13 @@ venues:
 			}
 			bookedVenue = v.Name
 			bookedWhen = slot.StartLabel()
-			// Block the booked date from future attempts.
-			if cfg.AddBlackout(slot.Date()) {
-				lg.Printf("[%s] added %s to blackout_dates", v.Name, slot.Date())
+			// Block the booking window around the booked date from future attempts.
+			added, berr := cfg.AddBookingBlackout(slot.Date())
+			if berr != nil {
+				lg.Printf("[%s] blackout window: %v", v.Name, berr)
+			}
+			if len(added) > 0 {
+				lg.Printf("[%s] added %s to blackout_dates", v.Name, venueconfig.DateSpan(added))
 			}
 			// Remove the booked venue from venues.json. Errors here are
 			// non-fatal — the booking is already confirmed at this point.

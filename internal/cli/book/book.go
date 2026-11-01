@@ -177,9 +177,10 @@ func updateConfig(path string, b booked, logf func(string, ...any)) {
 		logf("[%s] removed from venues.json", name)
 		fmt.Fprintf(os.Stderr, "stopped watching %s\n", name)
 	}
-	if blackedOut {
-		logf("added %s to blackout_dates", b.date)
-		fmt.Fprintf(os.Stderr, "blocked %s from further bookings\n", b.date)
+	if len(blackedOut) > 0 {
+		span := venueconfig.DateSpan(blackedOut)
+		logf("added %s to blackout_dates", span)
+		fmt.Fprintf(os.Stderr, "blocked %s from further bookings\n", strings.Replace(span, "..", " to ", 1))
 	}
 }
 

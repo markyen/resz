@@ -10,16 +10,33 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"time"
 
 	"resz/internal/platform"
 	"resz/internal/respath"
 )
 
 // Config is the top-level venues configuration file.
+//
+// BlackoutDates (blackout_dates) are YYYY-MM-DD dates on which nothing is
+// booked. A successful booking adds dates to it, and `resz tick` drops
+// dates before today.
+//
+// BookingBlackout (booking_blackout_days) is how many days a successful
+// booking blacks out, centered on the booked date; an even number puts
+// the extra day after it (2: the date and the next; 4: one before, two
+// after). It is global: it applies to every booking, whatever the venue.
+// Absent or 0 means 1, the booked date only; Load refuses a value outside
+// 0 to 31. Read it through BookingBlackoutDays.
 type Config struct {
-	Venues        []ConfigEntry `json:"venues"`
-	BlackoutDates []string      `json:"blackout_dates,omitempty"`
+	Venues          []ConfigEntry `json:"venues"`
+	BlackoutDates   []string      `json:"blackout_dates,omitempty"`
+	BookingBlackout int           `json:"booking_blackout_days,omitempty"`
 }
+
+// MaxBookingBlackoutDays bounds booking_blackout_days.
+const MaxBookingBlackoutDays = 31
 
 // ConfigEntry is one venue we care about. Identity (Platform, Name, ID)
 // and the cross-feature settings (PartySize, City) live at the top level.
@@ -109,6 +126,10 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	if n := cfg.BookingBlackout; n < 0 || n > MaxBookingBlackoutDays {
+		return nil, fmt.Errorf("%s: booking_blackout_days is %d; it must be 1 to %d (absent or 0 means 1)",
+			path, n, MaxBookingBlackoutDays)
+	}
 	return &cfg, nil
 }
 
@@ -140,6 +161,72 @@ func (c *Config) AddBlackout(date string) bool {
 	c.BlackoutDates = append(c.BlackoutDates, date)
 	sort.Strings(c.BlackoutDates)
 	return true
+}
+
+// BookingBlackoutDays returns how many days a booking blacks out: the
+// configured booking_blackout_days, or 1 when it is absent or 0.
+func (c *Config) BookingBlackoutDays() int {
+	if c.BookingBlackout <= 0 {
+		return 1
+	}
+	return c.BookingBlackout
+}
+
+// BookingWindow returns the days YYYY-MM-DD dates centered on date, in
+// order: (days-1)/2 before it and the rest after it, so an even count
+// puts the extra day after. Dates are calendar dates, stepped in UTC, so
+// no daylight-saving change can shift one.
+func BookingWindow(date string, days int) ([]string, error) {
+	d, err := time.ParseInLocation(platform.DateLayout, date, time.UTC)
+	if err != nil {
+		return nil, fmt.Errorf("booking date %q: %w", date, err)
+	}
+	if days < 1 || days > MaxBookingBlackoutDays {
+		return nil, fmt.Errorf("booking window of %d days: it must be 1 to %d", days, MaxBookingBlackoutDays)
+	}
+	before := (days - 1) / 2
+	out := make([]string, 0, days)
+	for k := -before; k < days-before; k++ {
+		out = append(out, d.AddDate(0, 0, k).Format(platform.DateLayout))
+	}
+	return out, nil
+}
+
+// AddBookingBlackout blacks out the booking window around date (see
+// BookingBlackoutDays) and returns the dates it added, in order; dates
+// already blacked out are skipped. A window's dates before today are
+// added like the rest; tick's housekeep drops them on its next pass. If
+// no window can be made around date, the date alone is added, and the
+// error is returned with it.
+func (c *Config) AddBookingBlackout(date string) ([]string, error) {
+	window, err := BookingWindow(date, c.BookingBlackoutDays())
+	if err != nil {
+		if c.AddBlackout(date) {
+			return []string{date}, err
+		}
+		return nil, err
+	}
+	var added []string
+	for _, d := range window {
+		if c.AddBlackout(d) {
+			added = append(added, d)
+		}
+	}
+	return added, nil
+}
+
+// DateSpan renders added dates for a log line: "2026-11-12" for one,
+// "2026-11-12..2026-11-15" for a run of consecutive days, and a comma
+// list when dates already blacked out break the run.
+func DateSpan(dates []string) string {
+	if len(dates) > 1 {
+		first, err1 := time.ParseInLocation(platform.DateLayout, dates[0], time.UTC)
+		last, err2 := time.ParseInLocation(platform.DateLayout, dates[len(dates)-1], time.UTC)
+		if err1 == nil && err2 == nil && first.AddDate(0, 0, len(dates)-1).Equal(last) {
+			return dates[0] + ".." + dates[len(dates)-1]
+		}
+	}
+	return strings.Join(dates, ", ")
 }
 
 // BlackoutSet converts a slice of date strings into a set for O(1) lookup.

@@ -65,8 +65,26 @@ func TestRecordBookingStopsWatchingTheVenue(t *testing.T) {
 	if got := names(cfg); got != "Venue B, Venue C, Venue D" {
 		t.Errorf("remaining = %s", got)
 	}
-	if !blackedOut || strings.Join(cfg.BlackoutDates, ",") != "2026-10-01,2026-10-25" {
+	if strings.Join(blackedOut, ",") != "2026-10-25" || strings.Join(cfg.BlackoutDates, ",") != "2026-10-01,2026-10-25" {
 		t.Errorf("blackout = %v (added %v)", cfg.BlackoutDates, blackedOut)
+	}
+}
+
+// booking_blackout_days widens what a watched booking blacks out, centered
+// on its date; an unwatched one still changes nothing.
+func TestRecordBookingBlacksOutTheWindow(t *testing.T) {
+	cfg := testConfig()
+	cfg.BookingBlackout = 3
+	_, blackedOut := recordBooking(cfg, booked{platform.SevenRooms, "venuea", "2026-10-25"})
+	if strings.Join(blackedOut, ",") != "2026-10-24,2026-10-25,2026-10-26" ||
+		strings.Join(cfg.BlackoutDates, ",") != "2026-10-01,2026-10-24,2026-10-25,2026-10-26" {
+		t.Errorf("blackout = %v (added %v)", cfg.BlackoutDates, blackedOut)
+	}
+	cfg = testConfig()
+	cfg.BookingBlackout = 3
+	removed, blackedOut := recordBooking(cfg, booked{platform.SevenRooms, "elsewhere", "2026-10-25"})
+	if len(removed) != 0 || len(blackedOut) != 0 || len(cfg.BlackoutDates) != 1 {
+		t.Errorf("unwatched: removed=%v blackedOut=%v dates=%v", removed, blackedOut, cfg.BlackoutDates)
 	}
 }
 
@@ -92,7 +110,7 @@ func TestRecordBookingForResy(t *testing.T) {
 func TestRecordBookingLeavesAnUnwatchedVenueAlone(t *testing.T) {
 	cfg := testConfig()
 	removed, blackedOut := recordBooking(cfg, booked{platform.SevenRooms, "elsewhere", "2026-10-25"})
-	if len(removed) != 0 || blackedOut || len(cfg.Venues) != 4 || len(cfg.BlackoutDates) != 1 {
+	if len(removed) != 0 || len(blackedOut) != 0 || len(cfg.Venues) != 4 || len(cfg.BlackoutDates) != 1 {
 		t.Errorf("config changed: removed=%v blackedOut=%v venues=%s dates=%v",
 			removed, blackedOut, names(cfg), cfg.BlackoutDates)
 	}

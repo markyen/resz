@@ -50,9 +50,10 @@ func parseBooked(ref string) (booked, error) {
 // the venue. Without it, a venue booked by hand after an approval stays
 // in the config, and check goes on asking about its other slots.
 //
-// It reports the names of the entries removed and whether the date was
-// newly blacked out; both may be empty when the venue wasn't watched.
-func recordBooking(cfg *venueconfig.Config, b booked) (removed []string, blackedOut bool) {
+// It reports the names of the entries removed and the dates newly blacked
+// out (the booking window, booking_blackout_days around the date); both
+// are empty when the venue wasn't watched.
+func recordBooking(cfg *venueconfig.Config, b booked) (removed []string, blackedOut []string) {
 	out := cfg.Venues[:0]
 	for _, v := range cfg.Venues {
 		if watches(v, b) {
@@ -66,7 +67,8 @@ func recordBooking(cfg *venueconfig.Config, b booked) (removed []string, blacked
 	// plans that night"), so it only follows a booking resz was watching
 	// for; an unrelated one-off booking leaves the config alone.
 	if len(removed) > 0 {
-		blackedOut = cfg.AddBlackout(b.date)
+		// An error here still blacks out the booked date itself.
+		blackedOut, _ = cfg.AddBookingBlackout(b.date)
 	}
 	return removed, blackedOut
 }
