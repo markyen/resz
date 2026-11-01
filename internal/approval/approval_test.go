@@ -45,7 +45,7 @@ func TestMessageQuotesTheVenuesTotal(t *testing.T) {
 			t.Errorf("message is missing %q:\n%s", want, msg)
 		}
 	}
-	// The old wording sent the person to the widget; resz books it now.
+	// resz books this slot itself, so the message never sends anyone to the widget.
 	if strings.Contains(msg, "widget") {
 		t.Errorf("a slot resz can book should not send anyone to the widget:\n%s", msg)
 	}

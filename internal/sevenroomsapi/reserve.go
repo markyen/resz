@@ -30,7 +30,7 @@ func Reserve(client *http.Client, ref Ref, guest Guest, logger func(string)) (*R
 
 // ReserveWithCard is Reserve for a slot the venue will only hold against
 // a card. card may be nil, in which case a card-required slot is refused
-// with ErrPaymentRequired exactly as before.
+// with ErrPaymentRequired.
 //
 // For a card slot the sequence gains steps between the hold and the
 // booking, mirroring the venue's own widget. The slot is priced from

@@ -27,7 +27,7 @@ func testGuest() Guest {
 		PhoneNumber: "5551234567", DialCode: "1", CountryCode: "us"}
 }
 
-// Without a card, a card-required slot is refused exactly as before.
+// Without a card, a card-required slot is refused with ErrPaymentRequired.
 func TestReserveWithoutCardStillRefuses(t *testing.T) {
 	ref := Ref{Venue: "examplevenue", TimeISO: "2026-09-26 20:45:00", PartySize: 2, RequiresPayment: true}
 	_, err := ReserveWithCard(nil, ref, testGuest(), nil, 0, nil)
@@ -86,8 +86,8 @@ func TestSetUpCardNeedsVenueID(t *testing.T) {
 	}
 }
 
-// card_token must only appear when there is one, so a free booking keeps
-// the exact shape it had before this change.
+// card_token appears only when there is a card, so a free booking's form
+// carries no card field at all.
 func TestBookOmitsCardTokenWhenEmpty(t *testing.T) {
 	// Exercised through the field map builder via a nil-client call that
 	// fails at transport; what matters is that the code path compiles and
@@ -160,7 +160,7 @@ func TestAuthorizedCeiling(t *testing.T) {
 	}
 }
 
-// Unattended callers authorize nothing, so the old behaviour is intact.
+// Unattended callers authorize nothing, so any slot that charges is refused.
 func TestZeroAuthorizationStillRefusesAnyCharge(t *testing.T) {
 	ref := Ref{
 		Venue: "paidvenue", TimeISO: "2026-10-31 17:30:00", PartySize: 2,
